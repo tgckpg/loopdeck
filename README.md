@@ -184,3 +184,31 @@ marks each start; `INDEX 00` pregaps stay with the preceding track. Track positi
 use millisecond precision. Tracks reopen/seek the image when advancing; seamless
 transitions between tracks are not guaranteed. Embedded metadata support depends
 on what the format's FFmpeg demuxer exposes.
+
+## Continuous albums / next-track buffering
+
+LoopDeck prepares about one second of the next queued track on a separate worker.
+For consecutive tracks with the same source sample rate, the prepared PCM is fed
+straight into the existing AudioTrack after the current track's last samples.
+The output is kept running, with no crossfade or added silence. Track titles and
+the playback position switch when the audio playback head reaches the boundary.
+This also applies to consecutive CUE tracks within an album image.
+
+Only the next track is prepared. Each stereo-float prefix uses about 345 KiB at
+44.1 kHz or 1.47 MiB at 192 kHz; a playing prefix and the next prefix can coexist.
+Seeking, choosing another track, stopping and activating an A–B loop invalidate
+pending handoffs. A sample-rate change or unavailable preload uses the normal
+track-loading path. Extremely short tracks, slow storage or decoding that cannot
+keep up can still underrun. Encoded silence in the files is preserved; codec
+padding handling depends on FFmpeg and the files' metadata.
+
+Host tests (JDK 17+):
+
+```sh
+python3 scripts/test-playback-handoff.py
+java -m jdk.compiler/com.sun.tools.javac.Main -d /tmp/loopdeck-tests \
+  app/src/main/java/net/astropenguin/loopdeck/PcmPrebuffer.java \
+  app/src/main/java/net/astropenguin/loopdeck/PrefetchSlot.java \
+  scripts/GaplessTest.java
+java -cp /tmp/loopdeck-tests net.astropenguin.loopdeck.GaplessTest
+```

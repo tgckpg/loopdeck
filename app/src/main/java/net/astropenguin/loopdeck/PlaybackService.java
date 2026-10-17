@@ -9,11 +9,14 @@ import android.os.*;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 public final class PlaybackService extends Service {
     private static final String CHANNEL = "playback";
     private static final int NOTIFICATION = 1;
+    private static final int NEXT_TRACK_BUFFER_SECONDS = 1;
     public final class LocalBinder extends Binder { PlaybackService service() { return PlaybackService.this; } }
     private final LocalBinder binder = new LocalBinder();
     private interface Command { void run() throws Exception; }
@@ -30,7 +33,20 @@ public final class PlaybackService extends Service {
     private long decoder;
     private AudioTrack output;
     private List<Track> queue = Collections.emptyList();
-    private int index = -1, rate;
+    private int index = -1, rate, sourceRate;
+    private final ExecutorService prefetcher=Executors.newSingleThreadExecutor();
+    private PrefetchSlot<Prepared> nextSlot;
+    private Prepared transition;
+    private long transitionAt;
+    private PcmPrebuffer activePrefix;
+
+    private static final class Prepared implements AutoCloseable {
+        long handle, start, end, duration, cursor;
+        int index, sourceRate;
+        String format;
+        PcmPrebuffer buffer;
+        @Override public void close() { if (handle!=0) { NativeDecoder.close(handle); handle=0; } }
+    }
     private long sourceStart, trackEnd;
     private long duration, a = -1, b = -1, cursor, base, written, headEpoch, lastHead;
     private boolean playing, loop, eof, resumeOnFocus;
@@ -154,7 +170,7 @@ public final class PlaybackService extends Service {
             if (file==null) throw new IOException("Cannot open selected file");
             decoder=NativeDecoder.open(file.getFd());
         }
-        int sourceRate=NativeDecoder.sourceRate(decoder);
+        sourceRate=NativeDecoder.sourceRate(decoder);
         Track selectedTrack=queue.get(index);
         long sourceDuration=NativeDecoder.duration(decoder);
         long end=selectedTrack.endMs;
@@ -169,7 +185,8 @@ public final class PlaybackService extends Service {
         }
         NativeDecoder.outputRate(decoder,rate);
         sourceStart=LoopMath.frame(selectedTrack.startMs,rate);
-        trackEnd=end<0 ? Long.MAX_VALUE : LoopMath.frame(end,rate)-sourceStart;
+        // Whole files must drain to actual decoder EOF: durationMs rounds off samples.
+        trackEnd=selectedTrack.endMs<0 ? Long.MAX_VALUE : LoopMath.frame(end,rate)-sourceStart;
         if (sourceStart>0) NativeDecoder.seek(decoder,sourceStart);
         format += "\nOutput: stereo float PCM · " + rate + " Hz (requested)";
         cursor=base=written=headEpoch=lastHead=0; blockSamples=blockOffset=0; eof=false;
@@ -177,6 +194,61 @@ public final class PlaybackService extends Service {
         session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE,title)
             .putLong(MediaMetadata.METADATA_KEY_DURATION,duration).build());
         setPlaying(true);
+        prepareNext();
+    }
+    private void cancelNext() {
+        if (nextSlot!=null) { nextSlot.cancel(); nextSlot=null; }
+        if (transition!=null) { transition.close(); transition=null; }
+    }
+    private void prepareNext() {
+        if (nextSlot!=null || transition!=null || loop || decoder==0 || index+1>=queue.size()) return;
+        final int nextIndex=index+1, outputRate=rate, expectedSourceRate=sourceRate;
+        final Track track=queue.get(nextIndex);
+        final PrefetchSlot<Prepared> slot=new PrefetchSlot<>(); nextSlot=slot;
+        prefetcher.submit(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            Prepared ready=new Prepared();
+            try {
+                if (slot.cancelled()) return;
+                try (ParcelFileDescriptor file=getContentResolver().openFileDescriptor(track.uri,"r")) {
+                    if (file==null) return;
+                    ready.handle=NativeDecoder.open(file.getFd());
+                }
+                ready.sourceRate=NativeDecoder.sourceRate(ready.handle);
+                // Preserve the source-rate policy; incompatible tracks use normal load().
+                if (ready.sourceRate!=expectedSourceRate || slot.cancelled()) return;
+                long total=NativeDecoder.duration(ready.handle), end=track.endMs;
+                if (total>0) end=end<0 ? total : Math.min(end,total);
+                if (end>=0 && end<=track.startMs) return;
+                ready.duration=end<0 ? 0 : end-track.startMs;
+                ready.start=LoopMath.frame(track.startMs,outputRate);
+                ready.end=track.endMs<0 ? Long.MAX_VALUE : LoopMath.frame(end,outputRate)-ready.start;
+                ready.index=nextIndex;
+                ready.format=NativeDecoder.description(ready.handle)+"\nOutput: stereo float PCM · "+outputRate+" Hz (requested)";
+                NativeDecoder.outputRate(ready.handle,outputRate);
+                if (ready.start>0) NativeDecoder.seek(ready.handle,ready.start);
+                final long handle=ready.handle;
+                ready.buffer=new PcmPrebuffer((pcm,frames) -> NativeDecoder.read(handle,pcm,frames),NEXT_TRACK_BUFFER_SECONDS*outputRate,ready.end);
+                ready.buffer.prepare(slot::cancelled);
+                slot.offer(ready); ready=null; // Slot now owns this decoder, including cancellation.
+            } catch (Exception | LinkageError | OutOfMemoryError ignored) {
+                // Retry through regular load at the boundary; don't interrupt the current track.
+            } finally { if (ready!=null) ready.close(); }
+        });
+    }
+    private void adoptTransition() {
+        if (transition==null || playedFrames()<transitionAt) return;
+        Prepared ready=transition; transition=null;
+        NativeDecoder.close(decoder); decoder=ready.handle; ready.handle=0;
+        index=ready.index; sourceStart=ready.start; trackEnd=ready.end; duration=ready.duration;
+        sourceRate=ready.sourceRate; format=ready.format; title=queue.get(index).name;
+        activePrefix=ready.buffer; cursor=ready.cursor;
+        // Keep AudioTrack and its cumulative playback head/written count intact.
+        base=-transitionAt; a=b=-1; loop=false; cache=null; eof=false;
+        status="Ready · continuous playback";
+        session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE,title)
+            .putLong(MediaMetadata.METADATA_KEY_DURATION,duration).build());
+        publish(); updateSession(); prepareNext();
     }
     private AudioTrack createOutput(int hz) {
         int minimum=AudioTrack.getMinBufferSize(hz,AudioFormat.CHANNEL_OUT_STEREO,AudioFormat.ENCODING_PCM_FLOAT);
@@ -225,6 +297,7 @@ public final class PlaybackService extends Service {
     private long positionFrames() { return output==null ? 0 : LoopMath.position(base,playedFrames(),a,b,loop); }
     private void resetAt(long target) throws IOException {
         // A seek invalidates decoder state as well as queued PCM. One worker owns both.
+        cancelNext(); activePrefix=null;
         boolean wasPlaying=playing;
         output.pause(); output.flush(); headEpoch=lastHead=written=0;
         base=cursor=target; blockSamples=blockOffset=0; eof=false;
@@ -234,6 +307,7 @@ public final class PlaybackService extends Service {
             NativeDecoder.seek(decoder,sourceStart+target);
         }
         if (wasPlaying) output.play();
+        prepareNext();
     }
     private boolean pump() throws Exception {
         if (blockOffset<blockSamples) {
@@ -243,7 +317,20 @@ public final class PlaybackService extends Service {
             blockOffset+=n; written+=n/2;
             return n>0;
         }
+        if (transition!=null) {
+            int count=transition.buffer.read(block,block.length/2);
+            transition.cursor+=count; blockSamples=count*2; blockOffset=0;
+            return count>0;
+        }
         if (eof) {
+            if (nextSlot!=null) {
+                Prepared ready=nextSlot.take();
+                if (ready!=null) {
+                    nextSlot.cancel(); nextSlot=null;
+                    transition=ready; transitionAt=written;
+                    return true; // Queue the prepared prefix directly after the outgoing samples.
+                }
+            }
             if (playedFrames()>=written) {
                 if (index+1<queue.size()) load(index+1);
                 else { setPlaying(false); status="End of queue"; }
@@ -263,7 +350,7 @@ public final class PlaybackService extends Service {
             count=Math.min(requested,(cache.length-cacheRead)/2);
             System.arraycopy(cache,cacheRead,block,0,count*2); cacheRead+=count*2;
         } else {
-            count=NativeDecoder.read(decoder,block,requested);
+            count=activePrefix!=null ? activePrefix.read(block,requested) : NativeDecoder.read(decoder,block,requested);
             if (cache!=null && count>0) { System.arraycopy(block,0,cache,cacheFilled,count*2); cacheFilled+=count*2; }
         }
         if (count==0) {
@@ -278,6 +365,7 @@ public final class PlaybackService extends Service {
         try {
             while (running) {
                 try {
+                    adoptTransition();
                     Command command=commands.poll(playing ? 0 : 100,TimeUnit.MILLISECONDS);
                     if (command!=null) { command.run(); publish(); updateSession(); }
                     if (playing && output!=null && !pump()) Thread.sleep(5);
@@ -293,6 +381,7 @@ public final class PlaybackService extends Service {
         } finally { releaseAudio(); session.setActive(false); session.release(); }
     }
     private void releaseAudio() {
+        cancelNext(); activePrefix=null;
         playing=false; cache=null; blockSamples=blockOffset=0;
         if (output!=null) { output.pause(); output.flush(); output.release(); output=null; }
         if (decoder!=0) { NativeDecoder.close(decoder); decoder=0; }
@@ -328,6 +417,7 @@ public final class PlaybackService extends Service {
     }
     @Override public void onDestroy() {
         unregisterReceiver(noisy); running=false; worker.interrupt();
+        prefetcher.shutdownNow();
         // Native IO may still be unwinding; the worker releases its own resources.
         super.onDestroy();
     }

@@ -103,3 +103,22 @@ Host checks for this change:
   invalid timestamps, duplicate indices, reversed starts and non-audio entries.
 - Existing `LoopMathTest` passed.
 - All application Java files passed the JDK parser; `git diff --check` passed.
+
+## Next-track buffering patch (base 64bee3e)
+
+- `GaplessTest` passed: exact stereo sample order across prefix/live reads,
+  irregular read sizes, short and empty tracks, explicit CUE limits, cancelled
+  preparation, resource ownership and 200 cancellation/publication races.
+- `test-playback-handoff.py` compiles the actual PlaybackService against fake
+  Android/native IO and simulates playback. Three tracks concatenate sample for
+  sample through one AudioTrack, with no intermediate flush/recreation. Metadata
+  follows the audible boundary. Seeking while the next track is queued discards
+  that handoff and restores the outgoing decoder; all decoder handles close.
+- Existing CUE parsing and loop arithmetic tests passed; application Java syntax
+  and `git diff --check` passed.
+
+These are host checks. No APK was built and no real AudioTrack/codec/storage
+playback was tested for this change. On the M11S, check a continuous lossless album
+with the screen off, seek/mark A–B close to a file boundary, pause/resume during a
+handoff, skip tracks, stop, and try a sample-rate change. Confirm the final samples
+of the last track play and no stale preloaded audio appears after a seek.

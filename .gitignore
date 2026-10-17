@@ -5,3 +5,4 @@ local.properties
 .deps/
 third_party/ffmpeg/
 *.iml
+*.swp
