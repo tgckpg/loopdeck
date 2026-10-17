@@ -236,3 +236,22 @@ void Decoder::seek(int64_t outputFrame) {
     pending.clear(); pendingOffset = 0;
     skipUntil = decodedNext = outputFrame;
 }
+
+std::string Decoder::cueSheet() const {
+    auto* tag=av_dict_get(format->metadata,"cuesheet",nullptr,0);
+    if (!tag) tag=av_dict_get(stream->metadata,"cuesheet",nullptr,0);
+    return tag ? tag->value : "";
+}
+std::vector<std::string> Decoder::chapters() const {
+    std::vector<std::string> result;
+    for (unsigned i=0;i<format->nb_chapters;++i) {
+        const auto* chapter=format->chapters[i];
+        auto start=av_rescale_q(chapter->start,chapter->time_base,AVRational{1,1000});
+        auto end=av_rescale_q(chapter->end,chapter->time_base,AVRational{1,1000});
+        auto* title=av_dict_get(chapter->metadata,"title",nullptr,0);
+        result.push_back(std::to_string(start));
+        result.push_back(std::to_string(end));
+        result.push_back(title ? title->value : "Track "+std::to_string(i+1));
+    }
+    return result;
+}

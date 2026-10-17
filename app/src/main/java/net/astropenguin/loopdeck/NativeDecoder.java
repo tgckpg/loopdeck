@@ -9,6 +9,8 @@ final class NativeDecoder {
     static native void close(long handle);
     static native int sourceRate(long handle) throws IOException;
     static native long duration(long handle) throws IOException;
+    static native String cueSheet(long handle) throws IOException;
+    static native String[] chapters(long handle) throws IOException;
     static native String description(long handle) throws IOException;
     static native void outputRate(long handle, int rate) throws IOException;
     static native int read(long handle, float[] buffer, int frames) throws IOException;

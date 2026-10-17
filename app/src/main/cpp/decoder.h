@@ -25,6 +25,8 @@ public:
     int sourceRate() const { return codec->sample_rate; }
     int64_t durationMs() const;
     std::string description() const;
+    std::string cueSheet() const;
+    std::vector<std::string> chapters() const;
 private:
     int fd = -1;
     AVFormatContext* format = nullptr;

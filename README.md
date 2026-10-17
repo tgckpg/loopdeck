@@ -162,3 +162,25 @@ app data unless you intend to re-grant folder permission.
 
 App source is MIT licensed. FFmpeg and the Gradle wrapper have their own licenses;
 see `THIRD_PARTY_NOTICES.md` before redistributing binaries.
+
+## Album images and track views
+
+Tap an album image (TAK, TTA, FLAC, APE, etc.) to show its numbered track list
+when track information is available. LoopDeck checks same-folder external CUE
+sheets first (preferring the image's basename), then an embedded `CUESHEET` tag,
+then container chapters exposed by FFmpeg. You can also tap a `.cue` directly,
+including sheets referencing several audio files in the same folder.
+
+Choose a track to play it. Its SeekBar, elapsed time, duration, media-session
+position and A–B markers are relative to that track, starting at zero. Playback
+ends at its boundary and advances to the next listed track. Previous/Next use
+the track list. Use the up arrow or Back to return to the folder. Images without
+usable track information continue to play as one file.
+
+External CUE `FILE` names must match audio filenames in the same folder; relative
+subdirectories and absolute paths are not resolved. UTF-8 and BOM-marked UTF-16
+are supported, with Windows-31J fallback for older Japanese sheets. `INDEX 01`
+marks each start; `INDEX 00` pregaps stay with the preceding track. Track positions
+use millisecond precision. Tracks reopen/seek the image when advancing; seamless
+transitions between tracks are not guaranteed. Embedded metadata support depends
+on what the format's FFmpeg demuxer exposes.

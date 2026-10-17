@@ -93,3 +93,13 @@ in this archive, and these checks do not cover all versions of every format.
 
 AudioTrack timing, final DAC format, actual gaplessness and responsiveness require
 the device. They are not established by host decoder tests.
+
+## Album-image track view patch
+
+Host checks for this change:
+
+- `CueSheetTest`: INDEX 01 boundaries, INDEX 00 pregaps, UTF-8 Japanese/emoji
+  titles, missing titles, titles after INDEX, multi-file sheets, long images,
+  invalid timestamps, duplicate indices, reversed starts and non-audio entries.
+- Existing `LoopMathTest` passed.
+- All application Java files passed the JDK parser; `git diff --check` passed.

@@ -52,3 +52,31 @@ Java_net_astropenguin_loopdeck_NativeDecoder_read(JNIEnv* env, jclass, jlong han
         return count;
     } catch (const std::exception& e) { report(env,e); return 0; }
 }
+
+// Decode standard UTF-8 rather than JNI's modified UTF-8 (track names may contain emoji).
+static jstring utf8(JNIEnv* env, const std::string& value) {
+    auto bytes=env->NewByteArray(value.size());
+    if (!bytes) return nullptr;
+    env->SetByteArrayRegion(bytes,0,value.size(),reinterpret_cast<const jbyte*>(value.data()));
+    auto charset=env->NewStringUTF("UTF-8");
+    auto type=env->FindClass("java/lang/String");
+    auto result=static_cast<jstring>(env->NewObject(type,env->GetMethodID(type,"<init>","([BLjava/lang/String;)V"),bytes,charset));
+    env->DeleteLocalRef(bytes); env->DeleteLocalRef(charset); env->DeleteLocalRef(type);
+    return result;
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_net_astropenguin_loopdeck_NativeDecoder_cueSheet(JNIEnv* env,jclass,jlong handle) {
+    try { return utf8(env,decoder(handle)->cueSheet()); } catch (const std::exception& e) { report(env,e); return nullptr; }
+}
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_net_astropenguin_loopdeck_NativeDecoder_chapters(JNIEnv* env,jclass,jlong handle) {
+    try {
+        auto values=decoder(handle)->chapters();
+        auto result=env->NewObjectArray(values.size(),env->FindClass("java/lang/String"),nullptr);
+        if (!result) return nullptr;
+        for (size_t i=0;i<values.size();++i) {
+            auto value=utf8(env,values[i]); env->SetObjectArrayElement(result,i,value); env->DeleteLocalRef(value);
+        }
+        return result;
+    } catch (const std::exception& e) { report(env,e); return nullptr; }
+}

@@ -31,6 +31,7 @@ public final class PlaybackService extends Service {
     private AudioTrack output;
     private List<Track> queue = Collections.emptyList();
     private int index = -1, rate;
+    private long sourceStart, trackEnd;
     private long duration, a = -1, b = -1, cursor, base, written, headEpoch, lastHead;
     private boolean playing, loop, eof, resumeOnFocus;
     private String title = "Choose a music folder", format = "", status = "Ready";
@@ -154,7 +155,12 @@ public final class PlaybackService extends Service {
             decoder=NativeDecoder.open(file.getFd());
         }
         int sourceRate=NativeDecoder.sourceRate(decoder);
-        duration=NativeDecoder.duration(decoder);
+        Track selectedTrack=queue.get(index);
+        long sourceDuration=NativeDecoder.duration(decoder);
+        long end=selectedTrack.endMs;
+        if (sourceDuration>0) end=end<0 ? sourceDuration : Math.min(end,sourceDuration);
+        if (end>=0 && end<=selectedTrack.startMs) throw new IOException("Track is outside the audio image");
+        duration=end<0 ? 0 : end-selectedTrack.startMs;
         format=NativeDecoder.description(decoder);
         rate=sourceRate;
         try { output=createOutput(rate); }
@@ -162,6 +168,9 @@ public final class PlaybackService extends Service {
             rate=48000; output=createOutput(rate);
         }
         NativeDecoder.outputRate(decoder,rate);
+        sourceStart=LoopMath.frame(selectedTrack.startMs,rate);
+        trackEnd=end<0 ? Long.MAX_VALUE : LoopMath.frame(end,rate)-sourceStart;
+        if (sourceStart>0) NativeDecoder.seek(decoder,sourceStart);
         format += "\nOutput: stereo float PCM · " + rate + " Hz (requested)";
         cursor=base=written=headEpoch=lastHead=0; blockSamples=blockOffset=0; eof=false;
         status=sourceRate==rate ? "Ready" : "Resampling to 48000 Hz";
@@ -222,7 +231,7 @@ public final class PlaybackService extends Service {
         if (cache!=null && cacheFilled==cache.length && loop) cacheRead=(int)((target-a)*2);
         else {
             if (cache!=null) cacheFilled=cacheRead=0;
-            NativeDecoder.seek(decoder,target);
+            NativeDecoder.seek(decoder,sourceStart+target);
         }
         if (wasPlaying) output.play();
     }
@@ -244,9 +253,11 @@ public final class PlaybackService extends Service {
         if (loop && cursor>=b) {
             cursor=a;
             if (cache!=null && cacheFilled==cache.length) { cacheRead=0; status="A–B loop · cached"; }
-            else { cache=null; NativeDecoder.seek(decoder,a); status="A–B loop · seek mode"; }
+            else { cache=null; NativeDecoder.seek(decoder,sourceStart+a); status="A–B loop · seek mode"; }
         }
-        int requested=loop ? (int)Math.min(block.length/2,b-cursor) : block.length/2;
+        long remaining=(loop ? b : trackEnd)-cursor;
+        if (remaining<=0) { eof=true; return false; }
+        int requested=(int)Math.min(block.length/2,remaining);
         int count;
         if (cache!=null && cacheFilled==cache.length) {
             count=Math.min(requested,(cache.length-cacheRead)/2);

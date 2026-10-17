@@ -11,6 +11,9 @@ import android.text.InputType;
 import android.view.*;
 import android.widget.*;
 import java.util.*;
+import java.io.*;
+import java.nio.*;
+import java.nio.charset.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,6 +28,7 @@ public final class MainActivity extends Activity {
     private final ArrayList<String> parents=new ArrayList<>();
     private PlaybackService player;
     private boolean bound, dragging, resumed;
+    private boolean trackView;
     private Uri tree;
     private String directory;
     private TextView folderLabel, trackTitle, trackFormat, times, loopTimes, status;
@@ -129,6 +133,7 @@ public final class MainActivity extends Activity {
         if (tree==null) return;
         final Uri selectedTree=tree;
         final String selectedDirectory=directory;
+        trackView=false;
         final int request=generation.incrementAndGet();
         entries.clear(); adapter.notifyDataSetChanged(); folderLabel.setText("Loading folder…");
         files.submit(() -> {
@@ -160,17 +165,109 @@ public final class MainActivity extends Activity {
     private void select(Entry entry) {
         if (entry.folder) { parents.add(directory); directory=entry.id; listFolder(); return; }
         if (player==null) { showError("Player is still starting"); return; }
+        if (entry.track==null) { openTrackView(entry); return; }
+        playEntry(entry);
+    }
+    private void playEntry(Entry entry) {
         ArrayList<Track> tracks=new ArrayList<>(); int selected=0;
         for (Entry candidate:entries) {
             if (!candidate.folder && (candidate==entry || candidate.audio)) {
                 if (candidate==entry) selected=tracks.size();
-                tracks.add(new Track(candidate.uri,candidate.name));
+                tracks.add(candidate.track!=null ? candidate.track : new Track(candidate.uri,candidate.name));
             }
         }
         ensureForeground(); player.play(tracks,selected);
     }
+    private static boolean isCue(Entry e) { return e.name.toLowerCase(Locale.ROOT).endsWith(".cue"); }
+    private String readCue(Entry e) throws IOException {
+        try (InputStream in=getContentResolver().openInputStream(e.uri)) {
+            if (in==null) throw new IOException("Cannot open CUE sheet");
+            ByteArrayOutputStream out=new ByteArrayOutputStream(); byte[] buffer=new byte[8192]; int n;
+            while ((n=in.read(buffer))!=-1) {
+                if (out.size()+n>2*1024*1024) throw new IOException("CUE sheet is too large");
+                out.write(buffer,0,n);
+            }
+            byte[] bytes=out.toByteArray();
+            if (bytes.length>=2 && ((bytes[0]==(byte)0xff && bytes[1]==(byte)0xfe) ||
+                (bytes[0]==(byte)0xfe && bytes[1]==(byte)0xff))) return new String(bytes,StandardCharsets.UTF_16);
+            try { return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString(); }
+            catch (CharacterCodingException invalidUtf8) { return new String(bytes,Charset.forName("windows-31j")); }
+        }
+    }
+    private ArrayList<Track> cueTracks(String text,List<Entry> folder,Entry image) {
+        return cueTracks(text,folder,image,false);
+    }
+    private ArrayList<Track> cueTracks(String text,List<Entry> folder,Entry image,boolean embedded) {
+        ArrayList<Track> result=new ArrayList<>();
+        for (CueSheet.Part part:CueSheet.parse(text)) {
+            Entry target=null;
+            String name=part.file.replace('\\','/');
+            while (name.startsWith("./")) name=name.substring(2);
+            if (image!=null && (embedded || name.isEmpty() || name.equalsIgnoreCase(image.name))) target=image;
+            if (image==null) for (Entry candidate:folder)
+                if (candidate.audio && candidate.name.equalsIgnoreCase(name)) { target=candidate; break; }
+            if (target!=null) result.add(new Track(target.uri,part.number+". "+part.title,part.start,part.end));
+            else if (image==null) return new ArrayList<>(); // Never play a partial/misresolved sheet.
+        }
+        return result;
+    }
+    private void openTrackView(Entry entry) {
+        final ArrayList<Entry> folder=new ArrayList<>(entries);
+        final int request=generation.incrementAndGet();
+        folderLabel.setText("Reading track information…");
+        files.submit(() -> {
+            ArrayList<Track> found=new ArrayList<>(); String error=null;
+            try {
+                if (isCue(entry)) {
+                    found=cueTracks(readCue(entry),folder,null);
+                    if (found.isEmpty()) throw new IOException("No usable audio tracks. CUE FILE names must match audio files in this folder.");
+                } else {
+                    // Prefer a same-named sheet, then sheets that explicitly reference this image.
+                    String stem=entry.name.replaceFirst("\\.[^.]+$","");
+                    folder.sort((x,y) -> Boolean.compare(!x.name.equalsIgnoreCase(stem+".cue"),!y.name.equalsIgnoreCase(stem+".cue")));
+                    for (Entry candidate:folder) if (isCue(candidate)) {
+                        try { found=cueTracks(readCue(candidate),folder,entry); } catch (IOException ignored) { continue; }
+                        if (!found.isEmpty()) break;
+                    }
+                    if (found.isEmpty()) {
+                        long handle=0;
+                        try (ParcelFileDescriptor file=getContentResolver().openFileDescriptor(entry.uri,"r")) {
+                            if (file==null) throw new IOException("Cannot open selected file");
+                            handle=NativeDecoder.open(file.getFd());
+                            found=cueTracks(NativeDecoder.cueSheet(handle),folder,entry,true);
+                            if (found.isEmpty()) {
+                                String[] chapters=NativeDecoder.chapters(handle);
+                                long total=NativeDecoder.duration(handle), previousEnd=-1;
+                                for (int i=0;i<chapters.length;i+=3) {
+                                    long start=Long.parseLong(chapters[i]), end=Long.parseLong(chapters[i+1]);
+                                    if (end<=start && i+3<chapters.length) end=Long.parseLong(chapters[i+3]);
+                                    if (end<=start) end=total;
+                                    if (start<0 || start<previousEnd || end<=start || (total>0 && end>total)) { found.clear(); break; }
+                                    found.add(new Track(entry.uri,(i/3+1)+". "+chapters[i+2],start,end)); previousEnd=end;
+                                }
+                            }
+                        } finally { if (handle!=0) NativeDecoder.close(handle); }
+                    }
+                }
+            } catch (Exception | LinkageError e) { error=e.getMessage(); }
+            final ArrayList<Track> tracks=found; final String failure=error;
+            main.post(() -> {
+                if (isDestroyed() || request!=generation.get()) return;
+                if (!tracks.isEmpty()) {
+                    trackView=true; entries.clear();
+                    for (Track track:tracks) entries.add(new Entry(track));
+                    adapter.notifyDataSetChanged(); folderLabel.setText(entry.name+" · "+tracks.size()+" tracks");
+                } else {
+                    folderLabel.setText(directory+" · "+entries.size()+" items");
+                    if (isCue(entry)) showError(failure==null ? "No track information found" : failure);
+                    else playEntry(entry);
+                }
+            });
+        });
+    }
     private void ensureForeground() { startForegroundService(new Intent(this,PlaybackService.class)); }
     private boolean goUp() {
+        if (trackView) { listFolder(); return true; }
         if (parents.isEmpty()) return false;
         directory=parents.remove(parents.size()-1); listFolder(); return true;
     }
@@ -230,8 +327,12 @@ public final class MainActivity extends Activity {
     }
     private static final class Entry {
         final String id,name; final Uri uri; final boolean folder,audio;
+        final Track track;
+        Entry(Track track) {
+            this.track=track; id=track.uri.toString(); name=track.name; uri=track.uri; folder=false; audio=true;
+        }
         Entry(String id,String name,String mime,Uri uri) {
-            this.id=id; this.name=name; this.uri=uri;
+            this.id=id; this.name=name; this.uri=uri; track=null;
             folder=DocumentsContract.Document.MIME_TYPE_DIR.equals(mime);
             audio=(mime!=null && mime.startsWith("audio/")) || name.toLowerCase(Locale.ROOT).matches(
                 ".*\\.(mp3|mp2|mp1|flac|ape|tak|tta|wv|wavpack|wma|wav|wave|aif|aiff|aifc|m4a|mp4|aac|ogg|oga|opus|mpc|mpp|shn|dsf|dff|ac3|dts|amr|au|snd|caf|ra|rm|spx|mka)$");
