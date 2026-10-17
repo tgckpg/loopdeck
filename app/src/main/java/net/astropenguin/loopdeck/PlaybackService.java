@@ -35,7 +35,6 @@ public final class PlaybackService extends Service {
     private AudioTrack output;
     private List<Track> queue = Collections.emptyList();
     private int index = -1, rate, sourceRate;
-    volatile boolean nativeRateOutput=true;
     private final ExecutorService prefetcher=Executors.newSingleThreadExecutor();
     private PrefetchSlot<Prepared> nextSlot;
     private Prepared transition;
@@ -118,25 +117,6 @@ public final class PlaybackService extends Service {
         List<Track> copy = new ArrayList<>(tracks);
         submit(() -> { queue=copy; load(selected); });
     }
-    void outputMode(boolean useNativeRate) { submit(() -> {
-        if (nativeRateOutput==useNativeRate) return;
-        long here=decoder==0 ? 0 : LoopMath.millis(positionFrames(),rate);
-        long oldA=a<0 ? -1 : LoopMath.millis(a,rate), oldB=b<0 ? -1 : LoopMath.millis(b,rate);
-        boolean wasPlaying=playing, wasLoop=loop;
-        nativeRateOutput=useNativeRate;
-        if (decoder==0) return;
-        // Reopen at the new rate; cancel prefetched PCM and translate frame positions.
-        load(index,false);
-        a=oldA<0 ? -1 : LoopMath.frame(oldA,rate);
-        b=oldB<0 ? -1 : LoopMath.frame(oldB,rate);
-        loop=wasLoop && LoopMath.valid(a,b);
-        long target=LoopMath.frame(here,rate);
-        if (loop) target=Math.max(a,Math.min(target,b-1));
-        resetAt(target);
-        warmupOutput();
-        status=loop ? "A–B loop · seek mode" : "Ready";
-        if (wasPlaying) setPlaying(true);
-    }); }
     void toggle() { submit(() -> { resumeOnFocus=false; setPlaying(!playing); }); }
     void next(int direction) { submit(() -> { if (!queue.isEmpty()) load(Math.floorMod(index + direction, queue.size())); }); }
     void seek(long ms) { submit(() -> {
@@ -183,8 +163,7 @@ public final class PlaybackService extends Service {
         resetAt(a);
         status=cache != null ? "A–B loop · buffering first pass" : "A–B loop · seek mode";
     }
-    private void load(int selected) throws Exception { load(selected,true); }
-    private void load(int selected, boolean autoplay) throws Exception {
+    private void load(int selected) throws Exception {
         if (selected < 0 || selected >= queue.size()) return;
         setPlaying(false); releaseAudio();
         index=selected; title=queue.get(index).name; format=""; status="Opening…"; resumeOnFocus=false;
@@ -201,7 +180,7 @@ public final class PlaybackService extends Service {
         if (end>=0 && end<=selectedTrack.startMs) throw new IOException("Track is outside the audio image");
         duration=end<0 ? 0 : end-selectedTrack.startMs;
         format=NativeDecoder.description(decoder);
-        rate=nativeRateOutput ? sourceRate : 44100;
+        rate=sourceRate;
         try { output=createOutput(rate); }
         catch (IllegalArgumentException | UnsupportedOperationException e) {
             rate=48000; output=createOutput(rate);
@@ -217,7 +196,7 @@ public final class PlaybackService extends Service {
         status=sourceRate==rate ? "Ready" : "Resampling to "+rate+" Hz";
         session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE,title)
             .putLong(MediaMetadata.METADATA_KEY_DURATION,duration).build());
-        if (autoplay) setPlaying(true);
+        setPlaying(true);
         prepareNext();
     }
     private void cancelNext() {

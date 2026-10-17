@@ -137,15 +137,15 @@ No APK was built. The silent lead-in must still be checked on the device to
 confirm that its output route wakes within one second. Ordinary pause/resume
 uses its existing queued audio without an added lead-in.
 
-## Output sample-rate toggle
+## Native sample-rate output (base 3d1cfda)
 
-- Added a persisted UI toggle: File native (default) / 44,100 Hz. Both retain
-  the existing 48,000 Hz fallback if Android rejects the requested format.
-- Host playback simulation passes: a 96 kHz source switches to 44.1 kHz and
-  back, preserving a 20 ms position, paused/playing state and 10–40 ms loop
-  markers. Reopening cancels prefetched PCM and adds output warmup silence.
-- Existing exact sample order, continuous handoff, EOF replay, warmup seek
-  cancellation and decoder ownership checks still pass.
+- Removed the rate toggle, persisted-setting reads/writes and forced 44.1 kHz
+  mode. Playback always requests the source rate, retaining the 48 kHz fallback
+  if Android rejects it. Existing saved toggle values are ignored.
+- Host playback simulation passed for native 96 kHz output and rejection of
+  96 kHz with fallback to 48 kHz, including rate-correct one-second warmup.
+- Existing silent startup, EOF replay, seek cancellation, gapless sample order,
+  audible metadata boundaries and decoder cleanup checks passed.
+- MainActivity and PlaybackService passed Java syntax parsing; diff checks passed.
 
-No APK was built; actual device routing and audible differences need device
-verification. File native requests the source sample rate, not a higher rate.
+No APK was built. Android/vendor processing may still change the rate downstream.
