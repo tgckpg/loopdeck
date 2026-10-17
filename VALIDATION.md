@@ -104,7 +104,7 @@ Host checks for this change:
 - Existing `LoopMathTest` passed.
 - All application Java files passed the JDK parser; `git diff --check` passed.
 
-## Next-track buffering patch (base 64bee3e)
+## Next-track buffering patch
 
 - `GaplessTest` passed: exact stereo sample order across prefix/live reads,
   irregular read sizes, short and empty tracks, explicit CUE limits, cancelled
@@ -122,3 +122,30 @@ playback was tested for this change. On the M11S, check a continuous lossless al
 with the screen off, seek/mark A–B close to a file boundary, pause/resume during a
 handoff, skip tracks, stop, and try a sample-rate change. Confirm the final samples
 of the last track play and no stale preloaded audio appears after a seek.
+
+## Output warmup patch
+
+- Playback service host simulation passed with exactly 44,100 stereo silent frames
+  before the first music sample, followed by exact three-track concatenation
+  through one AudioTrack with no extra silence at continuous boundaries.
+- Track position stays at zero during warmup; audible metadata boundaries and
+  the final track position remain correct. Seeking during warmup discards its
+  pending silence, and replay after EOF adds a fresh silent lead-in.
+- Existing queued-transition seek cancellation and decoder cleanup checks pass.
+
+No APK was built. The silent lead-in must still be checked on the device to
+confirm that its output route wakes within one second. Ordinary pause/resume
+uses its existing queued audio without an added lead-in.
+
+## Output sample-rate toggle
+
+- Added a persisted UI toggle: File native (default) / 44,100 Hz. Both retain
+  the existing 48,000 Hz fallback if Android rejects the requested format.
+- Host playback simulation passes: a 96 kHz source switches to 44.1 kHz and
+  back, preserving a 20 ms position, paused/playing state and 10–40 ms loop
+  markers. Reopening cancels prefetched PCM and adds output warmup silence.
+- Existing exact sample order, continuous handoff, EOF replay, warmup seek
+  cancellation and decoder ownership checks still pass.
+
+No APK was built; actual device routing and audible differences need device
+verification. File native requests the source sample rate, not a higher rate.

@@ -17,6 +17,7 @@ public final class PlaybackService extends Service {
     private static final String CHANNEL = "playback";
     private static final int NOTIFICATION = 1;
     private static final int NEXT_TRACK_BUFFER_SECONDS = 1;
+    private static final int OUTPUT_WARMUP_SECONDS = 1;
     public final class LocalBinder extends Binder { PlaybackService service() { return PlaybackService.this; } }
     private final LocalBinder binder = new LocalBinder();
     private interface Command { void run() throws Exception; }
@@ -34,6 +35,7 @@ public final class PlaybackService extends Service {
     private AudioTrack output;
     private List<Track> queue = Collections.emptyList();
     private int index = -1, rate, sourceRate;
+    volatile boolean nativeRateOutput=true;
     private final ExecutorService prefetcher=Executors.newSingleThreadExecutor();
     private PrefetchSlot<Prepared> nextSlot;
     private Prepared transition;
@@ -53,6 +55,7 @@ public final class PlaybackService extends Service {
     private String title = "Choose a music folder", format = "", status = "Ready";
     private final float[] block = new float[4096]; // 2048 stereo frames
     private int blockSamples, blockOffset;
+    private long warmupRemaining, warmupPosition;
     private float[] cache;
     private int cacheFilled, cacheRead;
     private long lastPublish, lastSession;
@@ -115,6 +118,25 @@ public final class PlaybackService extends Service {
         List<Track> copy = new ArrayList<>(tracks);
         submit(() -> { queue=copy; load(selected); });
     }
+    void outputMode(boolean useNativeRate) { submit(() -> {
+        if (nativeRateOutput==useNativeRate) return;
+        long here=decoder==0 ? 0 : LoopMath.millis(positionFrames(),rate);
+        long oldA=a<0 ? -1 : LoopMath.millis(a,rate), oldB=b<0 ? -1 : LoopMath.millis(b,rate);
+        boolean wasPlaying=playing, wasLoop=loop;
+        nativeRateOutput=useNativeRate;
+        if (decoder==0) return;
+        // Reopen at the new rate; cancel prefetched PCM and translate frame positions.
+        load(index,false);
+        a=oldA<0 ? -1 : LoopMath.frame(oldA,rate);
+        b=oldB<0 ? -1 : LoopMath.frame(oldB,rate);
+        loop=wasLoop && LoopMath.valid(a,b);
+        long target=LoopMath.frame(here,rate);
+        if (loop) target=Math.max(a,Math.min(target,b-1));
+        resetAt(target);
+        warmupOutput();
+        status=loop ? "A–B loop · seek mode" : "Ready";
+        if (wasPlaying) setPlaying(true);
+    }); }
     void toggle() { submit(() -> { resumeOnFocus=false; setPlaying(!playing); }); }
     void next(int direction) { submit(() -> { if (!queue.isEmpty()) load(Math.floorMod(index + direction, queue.size())); }); }
     void seek(long ms) { submit(() -> {
@@ -161,7 +183,8 @@ public final class PlaybackService extends Service {
         resetAt(a);
         status=cache != null ? "A–B loop · buffering first pass" : "A–B loop · seek mode";
     }
-    private void load(int selected) throws Exception {
+    private void load(int selected) throws Exception { load(selected,true); }
+    private void load(int selected, boolean autoplay) throws Exception {
         if (selected < 0 || selected >= queue.size()) return;
         setPlaying(false); releaseAudio();
         index=selected; title=queue.get(index).name; format=""; status="Opening…"; resumeOnFocus=false;
@@ -178,7 +201,7 @@ public final class PlaybackService extends Service {
         if (end>=0 && end<=selectedTrack.startMs) throw new IOException("Track is outside the audio image");
         duration=end<0 ? 0 : end-selectedTrack.startMs;
         format=NativeDecoder.description(decoder);
-        rate=sourceRate;
+        rate=nativeRateOutput ? sourceRate : 44100;
         try { output=createOutput(rate); }
         catch (IllegalArgumentException | UnsupportedOperationException e) {
             rate=48000; output=createOutput(rate);
@@ -190,10 +213,11 @@ public final class PlaybackService extends Service {
         if (sourceStart>0) NativeDecoder.seek(decoder,sourceStart);
         format += "\nOutput: stereo float PCM · " + rate + " Hz (requested)";
         cursor=base=written=headEpoch=lastHead=0; blockSamples=blockOffset=0; eof=false;
-        status=sourceRate==rate ? "Ready" : "Resampling to 48000 Hz";
+        warmupOutput();
+        status=sourceRate==rate ? "Ready" : "Resampling to "+rate+" Hz";
         session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE,title)
             .putLong(MediaMetadata.METADATA_KEY_DURATION,duration).build());
-        setPlaying(true);
+        if (autoplay) setPlaying(true);
         prepareNext();
     }
     private void cancelNext() {
@@ -244,6 +268,7 @@ public final class PlaybackService extends Service {
         sourceRate=ready.sourceRate; format=ready.format; title=queue.get(index).name;
         activePrefix=ready.buffer; cursor=ready.cursor;
         // Keep AudioTrack and its cumulative playback head/written count intact.
+        warmupPosition=0;
         base=-transitionAt; a=b=-1; loop=false; cache=null; eof=false;
         status="Ready · continuous playback";
         session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE,title)
@@ -263,7 +288,10 @@ public final class PlaybackService extends Service {
     }
     private void setPlaying(boolean value) throws IOException {
         if (output==null) return;
-        if (value && eof && playedFrames()>=written) resetAt(loop ? a : 0);
+        if (value && eof && playedFrames()>=written) {
+            resetAt(loop ? a : 0);
+            warmupOutput();
+        }
         if (value && !playing) {
             if (audioManager.requestAudioFocus(focus)!=AudioManager.AUDIOFOCUS_REQUEST_GRANTED) { status="Audio focus denied"; return; }
             output.play(); playing=true; if (!wake.isHeld()) wake.acquire();
@@ -294,13 +322,20 @@ public final class PlaybackService extends Service {
         if (head<lastHead) headEpoch+=1L<<32;
         lastHead=head; return headEpoch+head;
     }
-    private long positionFrames() { return output==null ? 0 : LoopMath.position(base,playedFrames(),a,b,loop); }
+    private long positionFrames() { return output==null ? 0 : Math.max(warmupPosition,LoopMath.position(base,playedFrames(),a,b,loop)); }
+    private void warmupOutput() {
+        // Send real PCM silence so the DAC/route wakes before any music is consumed.
+        // Include it in output timing, but exclude it from track position and markers.
+        warmupPosition=base;
+        warmupRemaining=(long)rate*OUTPUT_WARMUP_SECONDS;
+        base-=warmupRemaining;
+    }
     private void resetAt(long target) throws IOException {
         // A seek invalidates decoder state as well as queued PCM. One worker owns both.
         cancelNext(); activePrefix=null;
         boolean wasPlaying=playing;
         output.pause(); output.flush(); headEpoch=lastHead=written=0;
-        base=cursor=target; blockSamples=blockOffset=0; eof=false;
+        base=cursor=target; blockSamples=blockOffset=0; eof=false; warmupRemaining=warmupPosition=0;
         if (cache!=null && cacheFilled==cache.length && loop) cacheRead=(int)((target-a)*2);
         else {
             if (cache!=null) cacheFilled=cacheRead=0;
@@ -316,6 +351,12 @@ public final class PlaybackService extends Service {
             if ((n&1)!=0) throw new IOException("Unaligned stereo audio write");
             blockOffset+=n; written+=n/2;
             return n>0;
+        }
+        if (warmupRemaining>0) {
+            int count=(int)Math.min(block.length/2,warmupRemaining);
+            Arrays.fill(block,0,count*2,0f);
+            warmupRemaining-=count; blockSamples=count*2; blockOffset=0;
+            return true;
         }
         if (transition!=null) {
             int count=transition.buffer.read(block,block.length/2);
@@ -382,7 +423,7 @@ public final class PlaybackService extends Service {
     }
     private void releaseAudio() {
         cancelNext(); activePrefix=null;
-        playing=false; cache=null; blockSamples=blockOffset=0;
+        playing=false; cache=null; blockSamples=blockOffset=0; warmupRemaining=warmupPosition=0;
         if (output!=null) { output.pause(); output.flush(); output.release(); output=null; }
         if (decoder!=0) { NativeDecoder.close(decoder); decoder=0; }
         if (wake.isHeld()) wake.release();

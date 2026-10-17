@@ -32,13 +32,14 @@ public final class MainActivity extends Activity {
     private Uri tree;
     private String directory;
     private TextView folderLabel, trackTitle, trackFormat, times, loopTimes, status;
-    private Button play, setA, setB, loopButton, clear, previous, next, stop;
+    private Button play, setA, setB, loopButton, clear, previous, next, stop, outputRate;
     private SeekBar seek;
     private EntryAdapter adapter;
 
     private final ServiceConnection connection=new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
-            player=((PlaybackService.LocalBinder)binder).service(); render();
+            player=((PlaybackService.LocalBinder)binder).service();
+            player.outputMode(getPreferences(MODE_PRIVATE).getBoolean("nativeRateOutput",true)); render();
         }
         @Override public void onServiceDisconnected(ComponentName name) { player=null; }
     };
@@ -88,6 +89,13 @@ public final class MainActivity extends Activity {
         View divider=new View(this); divider.setBackgroundColor(Color.rgb(54,75,63)); root.addView(divider,new LinearLayout.LayoutParams(-1,dp(1)));
         trackTitle=text("Choose a track",18,TEXT); trackTitle.setMaxLines(2); trackTitle.setPadding(0,dp(6),0,0); root.addView(trackTitle);
         trackFormat=text("FFmpeg audio player",11,MUTED); trackFormat.setMaxLines(2); root.addView(trackFormat);
+        LinearLayout outputOptions=row();
+        outputRate=button(outputOptions,"Rate: File native",v -> {
+            if (player==null) return;
+            boolean useNative=!player.nativeRateOutput;
+            getPreferences(MODE_PRIVATE).edit().putBoolean("nativeRateOutput",useNative).apply();
+            player.outputMode(useNative);
+        }); root.addView(outputOptions);
         times=text("0:00.000 / 0:00.000",13,TEXT); root.addView(times);
         seek=new SeekBar(this); seek.setMax(10000); root.addView(seek,new LinearLayout.LayoutParams(-1,dp(36)));
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -273,6 +281,8 @@ public final class MainActivity extends Activity {
     }
     @Override public void onBackPressed() { if (!goUp()) super.onBackPressed(); }
     private void render() {
+        outputRate.setEnabled(player!=null);
+        if (player!=null) replace(outputRate,player.nativeRateOutput ? "Rate: File native" : "Rate: 44,100 Hz");
         if (player==null) return;
         PlaybackService.Snapshot s=player.snapshot;
         replace(trackTitle,s.title); replace(trackFormat,s.format); replace(status,s.status);
