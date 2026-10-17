@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.22.1)
+# Gradle configures this project. Avoid Ninja repeatedly regenerating build.ninja
+# when source/build trees have skewed timestamps (e.g. on an external volume).
+set(CMAKE_SUPPRESS_REGENERATION ON)
+project(loopdeck LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/ffmpeg/${ANDROID_ABI}")
+foreach(component avformat avcodec swresample avutil)
+    add_library(${component} SHARED IMPORTED)
+    set_target_properties(${component} PROPERTIES IMPORTED_LOCATION "${FFMPEG_ROOT}/lib/lib${component}.so")
+endforeach()
+add_library(loopdeck SHARED decoder.cpp tak1.cpp jni.cpp)
+target_include_directories(loopdeck PRIVATE "${FFMPEG_ROOT}/include")
+target_compile_options(loopdeck PRIVATE -Wall -Wextra -Werror=return-type)
+target_link_options(loopdeck PRIVATE -Wl,-z,max-page-size=16384)
+target_link_libraries(loopdeck avformat avcodec swresample avutil log)

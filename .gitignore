@@ -1,0 +1,7 @@
+.gradle/
+.cxx/
+**/build/
+local.properties
+.deps/
+third_party/ffmpeg/
+*.iml
