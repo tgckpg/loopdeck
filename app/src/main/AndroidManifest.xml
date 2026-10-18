@@ -2,6 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Legacy declarations stay uncapped while targetSdk is 29. No discovery/scan. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <application android:label="LoopDeck" android:theme="@style/AppTheme" android:allowBackup="false" android:icon="@drawable/ic_music">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
@@ -9,6 +13,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service android:name=".PlaybackService" android:exported="false" android:foregroundServiceType="mediaPlayback" />
+        <service android:name=".PlaybackService" android:exported="false" android:foregroundServiceType="mediaPlayback|connectedDevice" />
     </application>
 </manifest>

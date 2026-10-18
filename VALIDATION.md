@@ -149,3 +149,28 @@ uses its existing queued audio without an added lead-in.
 - MainActivity and PlaybackService passed Java syntax parsing; diff checks passed.
 
 No APK was built. Android/vendor processing may still change the rate downstream.
+
+## Bluetooth server/client (base 4cbe5c5)
+
+- All application Java sources compiled with JDK 17 against the official Android
+  API 35 `android.jar`. Deprecation warnings only. Manifest XML parsed and
+  `git diff --check` passed.
+- `test-bluetooth.py` passed using the actual `BluetoothLink`, `RemoteWire`,
+  `MusicLibrary` and CUE parser with fake Android adapters/storage and sockets
+  backed by loopback TCP. Covered Unicode/framing boundaries, invalid/truncated
+  input, protocol negotiation, 50-entry pages, folder-name filtering, full-folder
+  queues across pages, CUE selection, up/root navigation, rejection of stale
+  selections, all playback/marker commands, invalid times, disconnect/reconnect,
+  and rejection/recovery of an incompatible peer.
+- The actual PlaybackService host simulation passed. Added checks that all client
+  controls forward over Bluetooth without adding local playback work; Stop keeps
+  Server active and disabling Bluetooth after Stop lets the service stop.
+  Existing 96 kHz/fallback, startup silence, gapless sample order, audible metadata
+  and decoder cleanup checks still pass.
+
+No APK was built. On the FiiO/Pixel, verify initial Bluetooth pairing, permission
+prompts, folder grant, screen-off controls, media notifications, CUE browsing,
+A–B editing and native-rate output. Disconnect/reconnect, disable Bluetooth in
+Settings and switch modes while playing. Server playback should continue when the
+phone disconnects, and Client must never play the remote file locally. Hardware
+Bluetooth throughput, permissions and vendor background behavior remain unverified.

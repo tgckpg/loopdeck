@@ -1,6 +1,6 @@
 # LoopDeck 0.1
 
-A small, offline Android music player for the FiiO M11S. Native Java Views,
+A small, offline Android music player and Bluetooth remote for the FiiO M11S. Native Java Views,
 FFmpeg file parsing and decoding, a native TAK 1.0 decoder, AudioTrack output,
 and A–B repeat.
 
@@ -13,7 +13,7 @@ and A–B repeat.
 - Hold **Set A** or **Set B** to enter exact marker times in milliseconds.
 - Background playback, media notification, lock-screen controls and standard media keys.
 - Pause when headphones are disconnected; handle Android audio focus.
-- No full-library scan, artwork extraction, network access, account, or analytics.
+- Optional Bluetooth server/client control; no full-library scan, artwork extraction, Internet access, account, or analytics.
 
 The browser shows every file so unusual extensions can still be selected.
 Automatic next/previous includes recognized audio filenames and audio MIME types.
@@ -212,3 +212,56 @@ java -m jdk.compiler/com.sun.tools.javac.Main -d /tmp/loopdeck-tests \
   scripts/GaplessTest.java
 java -cp /tmp/loopdeck-tests net.astropenguin.loopdeck.GaplessTest
 ```
+
+## Bluetooth server / client
+
+Install the same APK on the player and phone. Music stays on the player: Bluetooth
+carries commands, folder names and playback state, with no audio streaming or file
+transfer. The player still decodes locally, requests the file's sample rate and
+runs the A–B loop itself.
+
+1. Pair the devices in **Android Settings → Bluetooth**. Finish pairing there,
+   then leave the Settings scan screen before connecting in LoopDeck.
+2. On the FiiO, choose **Music folder**, then **Bluetooth → Server**.
+3. On the Pixel, choose **Bluetooth → Client**, grant **Nearby devices** if
+   prompted, and choose the paired FiiO. The phone needs no music-folder grant.
+4. Browse the remote folders and album/CUE track lists using the normal list and
+   up arrow. **Remote root** returns to the shared music folder. Folders are
+   transferred in pages of 50; **Find / refresh** filters names in the current
+   folder or reloads the root. A blank filter shows everything in the folder.
+5. Play/pause, stop, previous/next, seek and all A–B controls operate on the FiiO,
+   including holding Set A/B for exact milliseconds. Marker taps use the player's
+   position when the command arrives; numeric editing avoids radio timing error.
+6. **Local player / Bluetooth off**, or **Bluetooth off** in the notification,
+   closes the link. Stopping music keeps Server running. Disconnecting the phone
+   leaves the FiiO playing and waiting for another connection. To reconnect, pick
+   **Client** and the player again. Switching the phone into Client pauses its
+   local playback; it does not resume automatically when leaving Client.
+
+The active mode lives in the foreground playback service, so leaving/rotating the
+screen keeps the connection. It is intentionally not auto-started after process
+or device restart. Both ends expose media-notification controls. Screen-off and
+battery-management behavior must be checked on the actual firmware.
+
+This uses one secure, bonded Bluetooth Classic RFCOMM peer, a dedicated service
+UUID and a versioned, length-prefixed JSON protocol. No discovery, BLE advertising,
+location access, Wi-Fi, TCP listener or new app dependencies are used. Pairing
+provides trust: any paired device running the matching client can control an
+enabled Server. Only the selected folder is exposed, using server-issued item
+indices rather than accepting arbitrary paths/URIs. The phone caches only the
+current page in memory. Messages are capped at 64 KiB and the outbound queue at
+32 messages; playback state is sent at most twice per second, only when changed.
+Audio decoding and Bluetooth/file IO run on separate workers.
+
+Host integration test (JDK 17+, test-only `org.json` jar):
+
+```sh
+curl -fL -o /tmp/loopdeck-json.jar \
+  https://repo.maven.apache.org/maven2/org/json/json/20240303/json-20240303.jar
+python3 scripts/test-bluetooth.py /tmp/loopdeck-json.jar
+python3 scripts/test-playback-handoff.py
+```
+
+The Bluetooth test runs the real protocol and shared folder/CUE code over fake
+RFCOMM backed by loopback TCP. It does not test Android permission prompts,
+Bluetooth hardware, radio coexistence or vendor power management.

@@ -24,6 +24,7 @@ public final class PlaybackService extends Service {
     private final LinkedBlockingQueue<Command> commands = new LinkedBlockingQueue<>();
     private volatile boolean running = true;
     private Thread worker;
+    BluetoothLink bluetooth;
     private AudioManager audioManager;
     private AudioFocusRequest focus;
     private PowerManager.WakeLock wake;
@@ -73,6 +74,7 @@ public final class PlaybackService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        bluetooth=new BluetoothLink(this);
         audioManager = (AudioManager)getSystemService(AUDIO_SERVICE);
         wake = ((PowerManager)getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LoopDeck:playback");
         wake.setReferenceCounted(false);
@@ -84,8 +86,8 @@ public final class PlaybackService extends Service {
             new NotificationChannel(CHANNEL, "Music playback", NotificationManager.IMPORTANCE_LOW));
         session = new MediaSession(this, "LoopDeck");
         session.setCallback(new MediaSession.Callback() {
-            @Override public void onPlay() { submit(() -> setPlaying(true)); }
-            @Override public void onPause() { submit(() -> { resumeOnFocus=false; setPlaying(false); }); }
+            @Override public void onPlay() { resumePlayback(); }
+            @Override public void onPause() { pausePlayback(); }
             @Override public void onStop() { stopPlayback(); }
             @Override public void onSkipToNext() { next(1); }
             @Override public void onSkipToPrevious() { next(-1); }
@@ -109,41 +111,72 @@ public final class PlaybackService extends Service {
             if ("next".equals(action)) next(1);
             if ("previous".equals(action)) next(-1);
             if ("stop".equals(action)) stopPlayback();
+            if ("bluetoothOff".equals(action)) stopBluetooth();
         }
         return START_NOT_STICKY;
+    }
+    Snapshot viewSnapshot() { return bluetooth!=null && bluetooth.mode==BluetoothLink.CLIENT ? bluetooth.remote : snapshot; }
+    private boolean remoteCommand(String command,Object... args) {
+        if (bluetooth==null || bluetooth.mode!=BluetoothLink.CLIENT) return false;
+        bluetooth.command(command,args); return true;
+    }
+    void resumePlayback() { if (!remoteCommand("resume")) submit(() -> setPlaying(true)); }
+    void pausePlayback() { if (!remoteCommand("pause")) submit(() -> { resumeOnFocus=false; setPlaying(false); }); }
+    void startBluetooth(int mode,String address) {
+        // Stop local sound before entering remote mode; leave precise decoding on the server.
+        if (mode==BluetoothLink.CLIENT) submit(() -> { resumeOnFocus=false; setPlaying(false); });
+        bluetooth.start(mode,address);
+        bluetoothChanged();
+    }
+    void bluetoothChanged() {
+        new Handler(getMainLooper()).post(() -> {
+            if (!running) return;
+            Snapshot s=viewSnapshot();
+            session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE,s.title)
+                .putLong(MediaMetadata.METADATA_KEY_DURATION,s.duration).build());
+            updateSession();
+        });
+    }
+    void stopBluetooth() {
+        bluetooth.close(); session.setActive(true); bluetoothChanged();
+        if (!snapshot.loaded) { stopForeground(true); foreground=false; stopSelf(); }
+        else ((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).notify(NOTIFICATION,notification());
     }
     private void submit(Command command) { if (running) commands.offer(command); }
     void play(List<Track> tracks, int selected) {
         List<Track> copy = new ArrayList<>(tracks);
         submit(() -> { queue=copy; load(selected); });
     }
-    void toggle() { submit(() -> { resumeOnFocus=false; setPlaying(!playing); }); }
-    void next(int direction) { submit(() -> { if (!queue.isEmpty()) load(Math.floorMod(index + direction, queue.size())); }); }
-    void seek(long ms) { submit(() -> {
+    void toggle() { if (remoteCommand("toggle")) return; submit(() -> { resumeOnFocus=false; setPlaying(!playing); }); }
+    void next(int direction) { if (remoteCommand(direction<0 ? "previous" : "next")) return; submit(() -> { if (!queue.isEmpty()) load(Math.floorMod(index + direction, queue.size())); }); }
+    void seek(long ms) { if (remoteCommand("seek","position",ms)) return; submit(() -> {
         if (decoder == 0) return;
         long target = LoopMath.frame(Math.max(0, duration > 0 ? Math.min(ms,duration) : ms), rate);
         if (loop && (target < a || target >= b)) { loop=false; cache=null; }
         resetAt(target); status=loop ? "A–B loop" : "Ready";
     }); }
-    void markA() { submit(() -> { if (decoder!=0) changeMarkers(positionFrames(), b); }); }
-    void markB() { submit(() -> { if (decoder!=0) changeMarkers(a, positionFrames()); }); }
-    void markers(long aMs, long bMs) { submit(() -> {
+    void markA() { if (remoteCommand("a")) return; submit(() -> { if (decoder!=0) changeMarkers(positionFrames(), b); }); }
+    void markB() { if (remoteCommand("b")) return; submit(() -> { if (decoder!=0) changeMarkers(a, positionFrames()); }); }
+    void markers(long aMs, long bMs) { if (remoteCommand("markers","a",aMs,"b",bMs)) return; submit(() -> {
         if (decoder!=0) changeMarkers(aMs < 0 ? -1 : LoopMath.frame(aMs,rate), bMs < 0 ? -1 : LoopMath.frame(bMs,rate));
     }); }
-    void clearLoop() { submit(() -> {
+    void clearLoop() { if (remoteCommand("clear")) return; submit(() -> {
         if (decoder==0) return;
         long here=positionFrames(); loop=false; a=b=-1; cache=null; resetAt(here); status="Loop cleared";
     }); }
-    void toggleLoop() { submit(() -> {
+    void toggleLoop() { if (remoteCommand("loop")) return; submit(() -> {
         if (decoder==0) return;
         if (!LoopMath.valid(a,b)) { status="Set A, then set B after A"; return; }
         if (loop) { long here=positionFrames(); loop=false; cache=null; resetAt(here); status="Loop off"; }
         else activateLoop();
     }); }
-    void stopPlayback() { submit(() -> {
+    void stopPlayback() { if (remoteCommand("stop")) return; submit(() -> {
         setPlaying(false); releaseAudio(); title="Stopped"; format=""; status="Choose a track";
         a=b=-1; loop=false; duration=0; updateSession();
-        new Handler(getMainLooper()).post(() -> { stopForeground(true); foreground=false; stopSelf(); });
+        new Handler(getMainLooper()).post(() -> {
+            if (bluetooth!=null && bluetooth.mode!=BluetoothLink.LOCAL) return;
+            stopForeground(true); foreground=false; stopSelf();
+        });
     }); }
     private void changeMarkers(long newA, long newB) throws IOException {
         long total=duration > 0 ? LoopMath.frame(duration,rate) : Long.MAX_VALUE;
@@ -414,28 +447,31 @@ public final class PlaybackService extends Service {
     }
     private void updateSession() { updateSession(true); }
     private void updateSession(boolean notify) {
+        Snapshot s=viewSnapshot();
         session.setPlaybackState(new PlaybackState.Builder().setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
             | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_STOP | PlaybackState.ACTION_SEEK_TO
             | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS)
-            .setState(playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,snapshot.position,playing ? 1f : 0f).build());
+            .setState(s.playing ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,s.position,s.playing ? 1f : 0f).build());
         if (notify && foreground) ((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).notify(NOTIFICATION,notification());
     }
     private PendingIntent action(String name) {
         return PendingIntent.getService(this,name.hashCode(),new Intent(this,PlaybackService.class).setAction(name),PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
     private Notification notification() {
-        Snapshot s=snapshot;
+        Snapshot s=viewSnapshot();
+        boolean linked=bluetooth!=null && bluetooth.mode!=BluetoothLink.LOCAL;
         PendingIntent open=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this,CHANNEL).setSmallIcon(R.drawable.ic_music).setContentTitle(s.title)
-            .setContentText(s.playing ? "Playing" : "Paused").setContentIntent(open).setOnlyAlertOnce(true)
-            .setOngoing(s.playing).setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setContentText(linked ? bluetooth.status : s.playing ? "Playing" : "Paused").setContentIntent(open).setOnlyAlertOnce(true)
+            .setOngoing(s.playing || linked).setVisibility(Notification.VISIBILITY_PUBLIC)
             .addAction(new Notification.Action.Builder(android.R.drawable.ic_media_previous,"Previous",action("previous")).build())
             .addAction(new Notification.Action.Builder(s.playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,s.playing ? "Pause" : "Play",action("toggle")).build())
             .addAction(new Notification.Action.Builder(android.R.drawable.ic_media_next,"Next",action("next")).build())
-            .addAction(new Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel,"Stop",action("stop")).build())
+            .addAction(new Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel,linked ? "Bluetooth off" : "Stop",action(linked ? "bluetoothOff" : "stop")).build())
             .setStyle(new Notification.MediaStyle().setMediaSession(session.getSessionToken()).setShowActionsInCompactView(0,1,2)).build();
     }
     @Override public void onDestroy() {
+        if (bluetooth!=null) bluetooth.close();
         unregisterReceiver(noisy); running=false; worker.interrupt();
         prefetcher.shutdownNow();
         // Native IO may still be unwinding; the worker releases its own resources.

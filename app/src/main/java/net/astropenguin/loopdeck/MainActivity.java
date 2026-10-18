@@ -1,8 +1,10 @@
 package net.astropenguin.loopdeck;
 
 import android.app.*;
+import android.bluetooth.*;
+import android.content.pm.PackageManager;
 import android.content.*;
-import android.database.Cursor;
+import net.astropenguin.loopdeck.MusicLibrary.Entry;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.*;
@@ -11,15 +13,12 @@ import android.text.InputType;
 import android.view.*;
 import android.widget.*;
 import java.util.*;
-import java.io.*;
-import java.nio.*;
-import java.nio.charset.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class MainActivity extends Activity {
-    private static final int PICK_FOLDER=10;
+    private static final int PICK_FOLDER=10, BT_PERMISSION=11;
     private static final int TEXT=Color.rgb(232,240,235), MUTED=Color.rgb(159,182,168);
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService files=Executors.newSingleThreadExecutor();
@@ -32,6 +31,11 @@ public final class MainActivity extends Activity {
     private Uri tree;
     private String directory;
     private TextView folderLabel, trackTitle, trackFormat, times, loopTimes, status;
+    private Button choose, bluetoothButton, pageBack, pageNext, find;
+    private LinearLayout remotePages;
+    private BluetoothLink.Listing remoteListing;
+    private boolean wasRemote;
+    private int pendingMode;
     private Button play, setA, setB, loopButton, clear, previous, next, stop;
     private SeekBar seek;
     private EntryAdapter adapter;
@@ -49,7 +53,7 @@ public final class MainActivity extends Activity {
         super.onCreate(saved);
         buildUi();
         bound=bindService(new Intent(this,PlaybackService.class),connection,BIND_AUTO_CREATE);
-        String stored=getPreferences(MODE_PRIVATE).getString("tree",null);
+        String stored=getSharedPreferences("MainActivity",MODE_PRIVATE).getString("tree",null);
         if (saved!=null) stored=saved.getString("tree",stored);
         if (stored!=null) {
             tree=Uri.parse(stored);
@@ -75,15 +79,28 @@ public final class MainActivity extends Activity {
         root.setPadding(dp(12),dp(6),dp(12),dp(6)); setContentView(root);
         LinearLayout top=row();
         TextView brand=text("LoopDeck",22,TEXT); top.addView(brand,new LinearLayout.LayoutParams(0,dp(44),1));
-        Button choose=new Button(this); choose.setText("Music folder"); choose.setAllCaps(false); choose.setOnClickListener(v -> pickFolder());
+        choose=new Button(this); choose.setText("Music folder"); choose.setAllCaps(false); choose.setOnClickListener(v -> pickFolder());
         top.addView(choose); root.addView(top);
+        LinearLayout bluetoothRow=row();
+        bluetoothButton=button(bluetoothRow,"Bluetooth: off",v -> bluetoothMenu());
+        root.addView(bluetoothRow);
+        remotePages=row();
+        pageBack=button(remotePages,"‹ Page",v -> { if (remote() && remoteListing!=null) player.bluetooth.page(remoteListing.offset-BluetoothLink.PAGE_SIZE); });
+        find=button(remotePages,"Find / refresh",v -> remoteSearch());
+        pageNext=button(remotePages,"Page ›",v -> { if (remote() && remoteListing!=null) player.bluetooth.page(remoteListing.offset+BluetoothLink.PAGE_SIZE); });
+        remotePages.setVisibility(View.GONE); root.addView(remotePages);
         LinearLayout navigation=row();
         Button up=new Button(this); up.setText("↑"); up.setContentDescription("Parent folder"); up.setOnClickListener(v -> goUp());
         navigation.addView(up,new LinearLayout.LayoutParams(dp(48),dp(44)));
         folderLabel=text("Select a folder on internal storage or microSD",12,MUTED); folderLabel.setMaxLines(2);
         navigation.addView(folderLabel,new LinearLayout.LayoutParams(0,dp(44),1)); root.addView(navigation);
         ListView list=new ListView(this); adapter=new EntryAdapter(); list.setAdapter(adapter);
-        list.setOnItemClickListener((parent,view,position,id) -> select(entries.get(position)));
+        list.setOnItemClickListener((parent,view,position,id) -> {
+            if (remote()) {
+                BluetoothLink.Listing current=remoteListing;
+                if (current!=null && position<current.items.size()) player.bluetooth.open(current.items.get(position),current);
+            } else select(entries.get(position));
+        });
         root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
         View divider=new View(this); divider.setBackgroundColor(Color.rgb(54,75,63)); root.addView(divider,new LinearLayout.LayoutParams(-1,dp(1)));
         trackTitle=text("Choose a track",18,TEXT); trackTitle.setMaxLines(2); trackTitle.setPadding(0,dp(6),0,0); root.addView(trackTitle);
@@ -93,10 +110,10 @@ public final class MainActivity extends Activity {
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onStartTrackingTouch(SeekBar bar) { dragging=true; }
             @Override public void onProgressChanged(SeekBar bar,int value,boolean user) {
-                if (user && player!=null) times.setText(time(player.snapshot.duration*value/10000)+" / "+time(player.snapshot.duration));
+                if (user && player!=null) times.setText(time(player.viewSnapshot().duration*value/10000)+" / "+time(player.viewSnapshot().duration));
             }
             @Override public void onStopTrackingTouch(SeekBar bar) {
-                if (player!=null) player.seek(player.snapshot.duration*bar.getProgress()/10000); dragging=false;
+                if (player!=null) player.seek(player.viewSnapshot().duration*bar.getProgress()/10000); dragging=false;
             }
         });
         LinearLayout transport=row();
@@ -115,6 +132,7 @@ public final class MainActivity extends Activity {
         status=text("Ready",12,MUTED); status.setMaxLines(3); status.setTextIsSelectable(true); root.addView(status);
     }
     private void pickFolder() {
+        if (remote()) { player.bluetooth.command("root"); return; }
         Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         startActivityForResult(intent,PICK_FOLDER);
@@ -126,11 +144,11 @@ public final class MainActivity extends Activity {
         try {
             getContentResolver().takePersistableUriPermission(chosen,data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION);
             tree=chosen; directory=DocumentsContract.getTreeDocumentId(tree); parents.clear();
-            getPreferences(MODE_PRIVATE).edit().putString("tree",tree.toString()).apply(); listFolder();
+            getSharedPreferences("MainActivity",MODE_PRIVATE).edit().putString("tree",tree.toString()).apply(); listFolder();
         } catch (Exception e) { showError("Folder permission failed: "+e.getMessage()); }
     }
     private void listFolder() {
-        if (tree==null) return;
+        if (tree==null || remote()) return;
         final Uri selectedTree=tree;
         final String selectedDirectory=directory;
         trackView=false;
@@ -140,22 +158,11 @@ public final class MainActivity extends Activity {
             ArrayList<Entry> result=new ArrayList<>();
             String error=null;
             try {
-                Uri children=DocumentsContract.buildChildDocumentsUriUsingTree(selectedTree,selectedDirectory);
-                String[] columns={DocumentsContract.Document.COLUMN_DOCUMENT_ID,DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE};
-                try (Cursor c=getContentResolver().query(children,columns,null,null,null)) {
-                    if (c==null) throw new IllegalStateException("Storage provider returned no folder listing");
-                    while (c.moveToNext()) {
-                        if (request!=generation.get()) return;
-                        String id=c.getString(0), name=c.getString(1), mime=c.getString(2);
-                        result.add(new Entry(id,name==null ? id : name,mime,DocumentsContract.buildDocumentUriUsingTree(selectedTree,id)));
-                    }
-                }
-                result.sort((x,y) -> x.folder!=y.folder ? (x.folder ? -1 : 1) : x.name.compareToIgnoreCase(y.name));
+                result.addAll(MusicLibrary.list(this,selectedTree,selectedDirectory));
             } catch (Exception e) { error="Cannot read folder: "+e.getMessage()+". Choose the folder again if the card changed."; }
             final String failure=error;
             main.post(() -> {
-                if (isDestroyed() || request!=generation.get()) return;
+                if (isDestroyed() || request!=generation.get() || remote()) return;
                 entries.addAll(result); adapter.notifyDataSetChanged();
                 folderLabel.setText(selectedDirectory+" · "+result.size()+" items");
                 if (failure!=null) showError(failure);
@@ -178,39 +185,6 @@ public final class MainActivity extends Activity {
         }
         ensureForeground(); player.play(tracks,selected);
     }
-    private static boolean isCue(Entry e) { return e.name.toLowerCase(Locale.ROOT).endsWith(".cue"); }
-    private String readCue(Entry e) throws IOException {
-        try (InputStream in=getContentResolver().openInputStream(e.uri)) {
-            if (in==null) throw new IOException("Cannot open CUE sheet");
-            ByteArrayOutputStream out=new ByteArrayOutputStream(); byte[] buffer=new byte[8192]; int n;
-            while ((n=in.read(buffer))!=-1) {
-                if (out.size()+n>2*1024*1024) throw new IOException("CUE sheet is too large");
-                out.write(buffer,0,n);
-            }
-            byte[] bytes=out.toByteArray();
-            if (bytes.length>=2 && ((bytes[0]==(byte)0xff && bytes[1]==(byte)0xfe) ||
-                (bytes[0]==(byte)0xfe && bytes[1]==(byte)0xff))) return new String(bytes,StandardCharsets.UTF_16);
-            try { return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString(); }
-            catch (CharacterCodingException invalidUtf8) { return new String(bytes,Charset.forName("windows-31j")); }
-        }
-    }
-    private ArrayList<Track> cueTracks(String text,List<Entry> folder,Entry image) {
-        return cueTracks(text,folder,image,false);
-    }
-    private ArrayList<Track> cueTracks(String text,List<Entry> folder,Entry image,boolean embedded) {
-        ArrayList<Track> result=new ArrayList<>();
-        for (CueSheet.Part part:CueSheet.parse(text)) {
-            Entry target=null;
-            String name=part.file.replace('\\','/');
-            while (name.startsWith("./")) name=name.substring(2);
-            if (image!=null && (embedded || name.isEmpty() || name.equalsIgnoreCase(image.name))) target=image;
-            if (image==null) for (Entry candidate:folder)
-                if (candidate.audio && candidate.name.equalsIgnoreCase(name)) { target=candidate; break; }
-            if (target!=null) result.add(new Track(target.uri,part.number+". "+part.title,part.start,part.end));
-            else if (image==null) return new ArrayList<>(); // Never play a partial/misresolved sheet.
-        }
-        return result;
-    }
     private void openTrackView(Entry entry) {
         final ArrayList<Entry> folder=new ArrayList<>(entries);
         final int request=generation.incrementAndGet();
@@ -218,48 +192,18 @@ public final class MainActivity extends Activity {
         files.submit(() -> {
             ArrayList<Track> found=new ArrayList<>(); String error=null;
             try {
-                if (isCue(entry)) {
-                    found=cueTracks(readCue(entry),folder,null);
-                    if (found.isEmpty()) throw new IOException("No usable audio tracks. CUE FILE names must match audio files in this folder.");
-                } else {
-                    // Prefer a same-named sheet, then sheets that explicitly reference this image.
-                    String stem=entry.name.replaceFirst("\\.[^.]+$","");
-                    folder.sort((x,y) -> Boolean.compare(!x.name.equalsIgnoreCase(stem+".cue"),!y.name.equalsIgnoreCase(stem+".cue")));
-                    for (Entry candidate:folder) if (isCue(candidate)) {
-                        try { found=cueTracks(readCue(candidate),folder,entry); } catch (IOException ignored) { continue; }
-                        if (!found.isEmpty()) break;
-                    }
-                    if (found.isEmpty()) {
-                        long handle=0;
-                        try (ParcelFileDescriptor file=getContentResolver().openFileDescriptor(entry.uri,"r")) {
-                            if (file==null) throw new IOException("Cannot open selected file");
-                            handle=NativeDecoder.open(file.getFd());
-                            found=cueTracks(NativeDecoder.cueSheet(handle),folder,entry,true);
-                            if (found.isEmpty()) {
-                                String[] chapters=NativeDecoder.chapters(handle);
-                                long total=NativeDecoder.duration(handle), previousEnd=-1;
-                                for (int i=0;i<chapters.length;i+=3) {
-                                    long start=Long.parseLong(chapters[i]), end=Long.parseLong(chapters[i+1]);
-                                    if (end<=start && i+3<chapters.length) end=Long.parseLong(chapters[i+3]);
-                                    if (end<=start) end=total;
-                                    if (start<0 || start<previousEnd || end<=start || (total>0 && end>total)) { found.clear(); break; }
-                                    found.add(new Track(entry.uri,(i/3+1)+". "+chapters[i+2],start,end)); previousEnd=end;
-                                }
-                            }
-                        } finally { if (handle!=0) NativeDecoder.close(handle); }
-                    }
-                }
+                found=MusicLibrary.tracks(this,entry,folder);
             } catch (Exception | LinkageError e) { error=e.getMessage(); }
             final ArrayList<Track> tracks=found; final String failure=error;
             main.post(() -> {
-                if (isDestroyed() || request!=generation.get()) return;
+                if (isDestroyed() || request!=generation.get() || remote()) return;
                 if (!tracks.isEmpty()) {
                     trackView=true; entries.clear();
                     for (Track track:tracks) entries.add(new Entry(track));
                     adapter.notifyDataSetChanged(); folderLabel.setText(entry.name+" · "+tracks.size()+" tracks");
                 } else {
                     folderLabel.setText(directory+" · "+entries.size()+" items");
-                    if (isCue(entry)) showError(failure==null ? "No track information found" : failure);
+                    if (MusicLibrary.isCue(entry)) showError(failure==null ? "No track information found" : failure);
                     else playEntry(entry);
                 }
             });
@@ -267,6 +211,10 @@ public final class MainActivity extends Activity {
     }
     private void ensureForeground() { startForegroundService(new Intent(this,PlaybackService.class)); }
     private boolean goUp() {
+        if (remote()) {
+            if (remoteListing==null || !remoteListing.up) return false;
+            player.bluetooth.command("up"); return true;
+        }
         if (trackView) { listFolder(); return true; }
         if (parents.isEmpty()) return false;
         directory=parents.remove(parents.size()-1); listFolder(); return true;
@@ -274,17 +222,39 @@ public final class MainActivity extends Activity {
     @Override public void onBackPressed() { if (!goUp()) super.onBackPressed(); }
     private void render() {
         if (player==null) return;
-        PlaybackService.Snapshot s=player.snapshot;
-        replace(trackTitle,s.title); replace(trackFormat,s.format); replace(status,s.status);
+        boolean client=remote();
+        if (client!=wasRemote) {
+            wasRemote=client; generation.incrementAndGet(); remoteListing=null;
+            entries.clear(); adapter.notifyDataSetChanged();
+            if (!client) { listFolder(); if (tree==null) folderLabel.setText("Select a folder on internal storage or microSD"); }
+        }
+        remotePages.setVisibility(client ? View.VISIBLE : View.GONE);
+        replace(choose,client ? "Remote root" : "Music folder");
+        BluetoothLink link=player.bluetooth;
+        replace(bluetoothButton,link.status+(link.error.isEmpty() ? "" : " · "+link.error));
+        if (client && remoteListing!=link.listing) {
+            remoteListing=link.listing; adapter.notifyDataSetChanged();
+            replace(folderLabel,remoteListing.title+" · "+(remoteListing.total==0 ? "0 items" : (remoteListing.offset+1)+"–"+(remoteListing.offset+remoteListing.items.size())+" / "+remoteListing.total));
+        }
+        if (client) {
+            boolean ready=link.connected;
+            pageBack.setEnabled(ready && remoteListing!=null && remoteListing.offset>0);
+            pageNext.setEnabled(ready && remoteListing!=null && remoteListing.offset+remoteListing.items.size()<remoteListing.total);
+            find.setEnabled(ready); choose.setEnabled(ready);
+        } else choose.setEnabled(true);
+        PlaybackService.Snapshot s=player.viewSnapshot();
+        replace(trackTitle,s.title); replace(trackFormat,s.format); replace(status,link.error.isEmpty() ? s.status : "Bluetooth: "+link.error+"\n"+s.status);
         replace(play,s.playing ? "Pause" : "Play"); replace(loopButton,s.loop ? "Loop on" : "Loop off");
         if (!dragging) {
             replace(times,time(s.position)+" / "+time(s.duration));
             int value=s.duration>0 ? (int)Math.min(10000,s.position*10000/s.duration) : 0;
             if (seek.getProgress()!=value) seek.setProgress(value);
         }
-        seek.setEnabled(s.loaded && s.duration>0);
-        play.setEnabled(s.loaded); stop.setEnabled(s.loaded);
-        setA.setEnabled(s.loaded); setB.setEnabled(s.loaded); loopButton.setEnabled(s.loaded); clear.setEnabled(s.loaded);
+        boolean available=!client || link.connected;
+        previous.setEnabled(available); next.setEnabled(available);
+        seek.setEnabled(available && s.loaded && s.duration>0);
+        play.setEnabled(available && s.loaded); stop.setEnabled(available && s.loaded);
+        setA.setEnabled(available && s.loaded); setB.setEnabled(available && s.loaded); loopButton.setEnabled(available && s.loaded); clear.setEnabled(available && s.loaded);
         replace(loopTimes,"A "+(s.a<0 ? "—" : time(s.a))+"     B "+(s.b<0 ? "—" : time(s.b))+"   ·   Hold to edit");
     }
     private static void replace(TextView view,String value) { if (!view.getText().toString().equals(value)) view.setText(value); }
@@ -293,8 +263,8 @@ public final class MainActivity extends Activity {
         return String.format(Locale.ROOT,"%d:%02d.%03d",ms/60000,ms/1000%60,ms%1000);
     }
     private void editMarkers() {
-        if (player==null || !player.snapshot.loaded) return;
-        PlaybackService.Snapshot s=player.snapshot;
+        if (player==null || !player.viewSnapshot().loaded) return;
+        PlaybackService.Snapshot s=player.viewSnapshot();
         LinearLayout form=new LinearLayout(this); form.setOrientation(LinearLayout.VERTICAL); form.setPadding(dp(20),0,dp(20),0);
         form.addView(text("Times in milliseconds. Leave a field blank to unset it.",14,MUTED));
         EditText inputA=new EditText(this), inputB=new EditText(this);
@@ -314,6 +284,60 @@ public final class MainActivity extends Activity {
             } catch (NumberFormatException e) { inputA.setError("Enter valid milliseconds"); }
         })); dialog.show();
     }
+    private boolean remote() { return player!=null && player.bluetooth!=null && player.bluetooth.mode==BluetoothLink.CLIENT; }
+    private void bluetoothMenu() {
+        if (player==null) return;
+        new AlertDialog.Builder(this).setTitle("Bluetooth mode")
+            .setItems(new String[]{"Local player / Bluetooth off","Server · play music here","Client · control a paired player"},(dialog,which) -> {
+                if (which==0) { player.stopBluetooth(); render(); }
+                else requestBluetooth(which);
+            }).setNegativeButton("Cancel",null).show();
+    }
+    private void requestBluetooth(int mode) {
+        pendingMode=mode;
+        if (Build.VERSION.SDK_INT>=31 && checkSelfPermission("android.permission.BLUETOOTH_CONNECT")!=PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.BLUETOOTH_CONNECT"},BT_PERMISSION); return;
+        }
+        configureBluetooth(mode);
+    }
+    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] grants) {
+        super.onRequestPermissionsResult(request,permissions,grants);
+        if (request==BT_PERMISSION) {
+            if (grants.length>0 && grants[0]==PackageManager.PERMISSION_GRANTED) configureBluetooth(pendingMode);
+            else showError("Nearby devices permission is required for Bluetooth control.");
+        }
+    }
+    private void configureBluetooth(int mode) {
+        if (player==null) return;
+        try {
+            BluetoothManager manager=(BluetoothManager)getSystemService(BLUETOOTH_SERVICE);
+            BluetoothAdapter bluetooth=manager==null ? null : manager.getAdapter();
+            if (bluetooth==null || !bluetooth.isEnabled()) { showError("Enable Bluetooth in Android Settings first."); return; }
+            if (mode==BluetoothLink.SERVER) {
+                if (tree==null) { showError("Choose a Music folder on this player first."); return; }
+                ensureForeground(); player.startBluetooth(mode,null); render(); return;
+            }
+            ArrayList<BluetoothDevice> devices=new ArrayList<>(bluetooth.getBondedDevices());
+            devices.sort((a,b) -> deviceLabel(a).compareToIgnoreCase(deviceLabel(b)));
+            if (devices.isEmpty()) { showError("Pair the phone and player in Android Bluetooth Settings first, then return here."); return; }
+            String[] labels=new String[devices.size()];
+            for (int i=0;i<labels.length;i++) labels[i]=deviceLabel(devices.get(i));
+            new AlertDialog.Builder(this).setTitle("Paired player · start Server there first").setItems(labels,(dialog,index) -> {
+                ensureForeground(); player.startBluetooth(BluetoothLink.CLIENT,devices.get(index).getAddress()); render();
+            }).setNegativeButton("Cancel",null).show();
+        } catch (Exception e) { showError("Bluetooth: "+e.getMessage()); }
+    }
+    private static String deviceLabel(BluetoothDevice device) {
+        String name=device.getName(); return (name==null ? "Bluetooth device" : name)+" · "+device.getAddress();
+    }
+    private void remoteSearch() {
+        if (!remote()) return;
+        EditText query=new EditText(this); query.setSingleLine(true); query.setHint("Filename in this folder (blank = all)");
+        new AlertDialog.Builder(this).setTitle("Find in remote folder").setView(query)
+            .setPositiveButton("Find",(dialog,which) -> { if (remote()) player.bluetooth.command("filter","query",query.getText().toString()); })
+            .setNeutralButton("Refresh root",(dialog,which) -> { if (remote()) player.bluetooth.command("root"); })
+            .setNegativeButton("Cancel",null).show();
+    }
     private void showError(String message) { new AlertDialog.Builder(this).setTitle("LoopDeck").setMessage(message).setPositiveButton("OK",null).show(); }
     @Override protected void onResume() { super.onResume(); resumed=true; main.post(tick); }
     @Override protected void onPause() { resumed=false; main.removeCallbacks(tick); super.onPause(); }
@@ -325,28 +349,18 @@ public final class MainActivity extends Activity {
         generation.incrementAndGet(); files.shutdownNow(); main.removeCallbacks(tick);
         if (bound) unbindService(connection); super.onDestroy();
     }
-    private static final class Entry {
-        final String id,name; final Uri uri; final boolean folder,audio;
-        final Track track;
-        Entry(Track track) {
-            this.track=track; id=track.uri.toString(); name=track.name; uri=track.uri; folder=false; audio=true;
-        }
-        Entry(String id,String name,String mime,Uri uri) {
-            this.id=id; this.name=name; this.uri=uri; track=null;
-            folder=DocumentsContract.Document.MIME_TYPE_DIR.equals(mime);
-            audio=(mime!=null && mime.startsWith("audio/")) || name.toLowerCase(Locale.ROOT).matches(
-                ".*\\.(mp3|mp2|mp1|flac|ape|tak|tta|wv|wavpack|wma|wav|wave|aif|aiff|aifc|m4a|mp4|aac|ogg|oga|opus|mpc|mpp|shn|dsf|dff|ac3|dts|amr|au|snd|caf|ra|rm|spx|mka)$");
-        }
-    }
     private final class EntryAdapter extends BaseAdapter {
-        @Override public int getCount() { return entries.size(); }
-        @Override public Object getItem(int position) { return entries.get(position); }
+        @Override public int getCount() { return remote() ? (remoteListing==null ? 0 : remoteListing.items.size()) : entries.size(); }
+        @Override public Object getItem(int position) { return remote() ? remoteListing.items.get(position) : entries.get(position); }
         @Override public long getItemId(int position) { return position; }
         @Override public View getView(int position,View reusable,ViewGroup parent) {
             TextView view=reusable instanceof TextView ? (TextView)reusable : text("",15,TEXT);
             view.setPadding(dp(10),dp(12),dp(6),dp(12)); view.setMinHeight(dp(50)); view.setMaxLines(2);
-            Entry e=entries.get(position); view.setText((e.folder ? "▸  " : "")+e.name);
-            view.setTextColor(e.folder ? Color.rgb(115,218,193) : TEXT); return view;
+            boolean folder; String name;
+            if (remote()) { BluetoothLink.Item e=remoteListing.items.get(position); folder=e.folder; name=e.name; }
+            else { Entry e=entries.get(position); folder=e.folder; name=e.name; }
+            view.setText((folder ? "▸  " : "")+name);
+            view.setTextColor(folder ? Color.rgb(115,218,193) : TEXT); return view;
         }
     }
 }
