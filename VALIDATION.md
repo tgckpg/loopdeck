@@ -174,3 +174,25 @@ A–B editing and native-rate output. Disconnect/reconnect, disable Bluetooth in
 Settings and switch modes while playing. Server playback should continue when the
 phone disconnects, and Client must never play the remote file locally. Hardware
 Bluetooth throughput, permissions and vendor background behavior remain unverified.
+
+## Controller refactor (base def581b)
+
+- Added one service-owned `PlayerController` for local/Bluetooth command routing,
+  snapshot selection, folder workers and a common immutable browser model. Removed
+  remote routing from PlaybackService's local playback API and the activity's
+  click handlers/list adapter. Media-session and notification actions enter the
+  same controller as the activity.
+- Expanded the Bluetooth host integration test to run the actual controller with
+  the actual protocol and library reader. Verified all actions locally and over
+  the link, snapshot selection, shared folder/CUE navigation, paging/filtering,
+  folder-picker routing, preservation of a live CUE view during state restore,
+  returning to local mode and cancellation of an in-flight local metadata result
+  when entering Client. Remote actions do not invoke the local playback engine.
+- Existing protocol and playback-handoff tests passed, including keeping Server
+  alive after stopping playback. Java sources compiled against Android API 35;
+  `git diff --check` and patch applicability checks passed.
+- Nonempty paired-device lists now use “Select a paired device”; empty lists
+  retain the original setup title and show the pairing instructions.
+
+No APK was built. Device UI, permission dialogs and real Bluetooth remain checks
+for the owner after applying the patch.

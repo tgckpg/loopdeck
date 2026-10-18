@@ -153,7 +153,9 @@ app data unless you intend to re-grant folder permission.
 
 ## Source layout
 
-- `MainActivity.java`: folder listing and native controls; file queries use a worker.
+- `MainActivity.java`: native controls, Android permission/picker dialogs and rendering.
+- `PlayerController.java`: local/Bluetooth routing, common browser rows/capabilities,
+  folder workers and playback commands shared by the UI and media controls.
 - `PlaybackService.java`: single playback worker, AudioTrack, loop cache and media session.
 - `decoder.cpp`: FFmpeg custom file-descriptor IO, decoding, resampling and seeking.
 - `tak1.cpp`: native TAK 1.0 decoding, selected automatically for codec type 0.
@@ -265,3 +267,15 @@ python3 scripts/test-playback-handoff.py
 The Bluetooth test runs the real protocol and shared folder/CUE code over fake
 RFCOMM backed by loopback TCP. It does not test Android permission prompts,
 Bluetooth hardware, radio coexistence or vendor power management.
+
+### Controller boundary
+
+UI and media commands go through `PlayerController`: `perform(Action)`, `seek`,
+`markers`, `open`, `page`, `up`, `filter`, `refresh` and `chooseFolder`. The controller
+owns local/remote selection and publishes one immutable `Browser` model for either
+source. `PlaybackService` methods always operate on local audio; the Bluetooth
+server invokes those local methods for incoming commands. The activity never
+sends protocol messages or decides how to route playback/browsing commands.
+
+The paired-device dialog says **Select a paired device** when there are devices
+to choose from. An empty list shows the original Server/pairing setup message.

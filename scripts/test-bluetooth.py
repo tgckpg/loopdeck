@@ -18,14 +18,16 @@ with tempfile.TemporaryDirectory(prefix='loopdeck-bluetooth-') as temp:
  stub('android/os/Handler','''
  static final java.util.concurrent.ScheduledExecutorService timer=java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r->{Thread t=new Thread(r);t.setDaemon(true);return t;});
  final java.util.Map<Runnable,java.util.concurrent.Future<?>> jobs=new java.util.concurrent.ConcurrentHashMap<>();
- public Handler(Looper l){} public void postDelayed(Runnable r,long ms){jobs.put(r,timer.schedule(r,ms,java.util.concurrent.TimeUnit.MILLISECONDS));}
+ public Handler(Looper l){} public void post(Runnable r){r.run();} public void postDelayed(Runnable r,long ms){jobs.put(r,timer.schedule(r,ms,java.util.concurrent.TimeUnit.MILLISECONDS));}
  public void removeCallbacks(Runnable r){java.util.concurrent.Future<?> f=jobs.remove(r);if(f!=null)f.cancel(false);}
  ''')
+ stub('android/os/Bundle','final java.util.Map<String,Object> values=new java.util.HashMap<>();public void putString(String k,String v){values.put(k,v);} public String getString(String k){return (String)values.get(k);} public String getString(String k,String fallback){return (String)values.getOrDefault(k,fallback);} public void putStringArrayList(String k,java.util.ArrayList<String> v){values.put(k,new java.util.ArrayList<>(v));} @SuppressWarnings("unchecked") public java.util.ArrayList<String> getStringArrayList(String k){return (java.util.ArrayList<String>)values.get(k);}')
+ stub('android/content/Intent','public Intent(Context c,Class<?> target){}')
  stub('android/os/SystemClock','public static long elapsedRealtime(){return System.nanoTime()/1000000;}')
  stub('android/net/Uri','public final String id; public Uri(String id){this.id=id;} public static Uri parse(String id){return new Uri(id);} public String toString(){return id;}')
  stub('android/os/ParcelFileDescriptor','public int getFd(){return 1;} public void close(){}',' implements AutoCloseable')
- stub('android/content/Context','public static final String BLUETOOTH_SERVICE="bluetooth"; public static final int MODE_PRIVATE=0; public Object getSystemService(String n){return null;} public SharedPreferences getSharedPreferences(String n,int m){return new SharedPreferences();} public ContentResolver getContentResolver(){return new ContentResolver();}')
- stub('android/content/SharedPreferences','public String getString(String k,String fallback){return "root";}')
+ stub('android/content/Context','public static final String BLUETOOTH_SERVICE="bluetooth"; public static final int MODE_PRIVATE=0; public Object getSystemService(String n){return null;} public void startForegroundService(Intent i){} public SharedPreferences getSharedPreferences(String n,int m){return new SharedPreferences();} public ContentResolver getContentResolver(){return new ContentResolver();}')
+ stub('android/content/SharedPreferences','public String getString(String k,String fallback){return "root";} public Editor edit(){return new Editor();} public static class Editor {public Editor putString(String k,String v){return this;} public void apply(){}}')
  stub('android/content/ContentResolver','''
  public android.database.Cursor query(android.net.Uri uri,String[] columns,String a,String[] b,String c){
   java.util.List<String[]> rows=new java.util.ArrayList<>();
@@ -76,7 +78,8 @@ with tempfile.TemporaryDirectory(prefix='loopdeck-bluetooth-') as temp:
  public void close()throws java.io.IOException{if(socket!=null)socket.close();}
  ''')
  stub('net/astropenguin/loopdeck/NativeDecoder','''
- static int openCount; static long open(int fd){openCount++;return 1;} static void close(long h){openCount--;}
+ static volatile int openCount; static volatile java.util.concurrent.CountDownLatch entered,release;
+ static long open(int fd){openCount++;if(entered!=null){entered.countDown();try{release.await();}catch(InterruptedException e){Thread.currentThread().interrupt();}}return 1;} static void close(long h){openCount--;}
  static String cueSheet(long h){return "";} static String[] chapters(long h){return new String[0];} static long duration(long h){return 120000;}
  ''')
  stub('net/astropenguin/loopdeck/PlaybackService','''
@@ -91,7 +94,7 @@ with tempfile.TemporaryDirectory(prefix='loopdeck-bluetooth-') as temp:
  final java.util.List<String> calls=new java.util.concurrent.CopyOnWriteArrayList<>();
  volatile java.util.List<Track> queue; volatile int selected;
  void play(java.util.List<Track> q,int i){queue=q;selected=i;calls.add("play");}
- void bluetoothChanged(){}
+ void bluetoothChanged(){} void bluetoothStopped(){}
  void toggle(){calls.add("toggle");} void resumePlayback(){calls.add("resume");} void pausePlayback(){calls.add("pause");}
  void stopPlayback(){calls.add("stop");} void next(int d){calls.add(d>0?"next":"previous");}
  void seek(long ms){calls.add("seek:"+ms);} void markA(){calls.add("a");} void markB(){calls.add("b");}
@@ -151,12 +154,56 @@ public final class BluetoothTest {
    await(()->server.error.contains("Incompatible"));invalid.close();
    client.start(BluetoothLink.CLIENT,"fiio");await(()->client.connected && client.listing.total==128);
    expect(NativeDecoder.openCount==0);
+   client.close();await(()->!server.connected);
+   // The same controller API drives local and remote browsing/playback.
+   PlaybackService controlled=new PlaybackService("controller-phone");
+   PlayerController control=new PlayerController(controlled);
+   try {
+    await(()->control.browser().items.size()==128);
+    expect(!control.browser().paged && control.available());
+    int[] pickerCalls={0};control.chooseFolder(()->pickerCalls[0]++);expect(pickerCalls[0]==1);
+    for(PlayerController.Action action:PlayerController.Action.values())
+     if(action!=PlayerController.Action.SEEK && action!=PlayerController.Action.MARKERS)control.perform(action);
+    control.seek(789);control.markers(100,500);
+    expect(controlled.calls.containsAll(List.of("toggle","resume","pause","stop","next","previous","a","b","loop","clear","seek:789","markers:100:500")));
+    control.open(control.browser(),0);await(()->control.browser().items.size()==2);
+    control.open(control.browser(),0);await(()->!control.browser().items.isEmpty() && control.browser().items.get(0).name.equals("1. One"));
+    android.os.Bundle saved=new android.os.Bundle();control.saveBrowser(saved);PlayerController.Browser cueView=control.browser();
+    control.restoreBrowser(saved);expect(control.browser()==cueView); // Rotation preserves the current CUE view.
+    control.open(cueView,1);expect(controlled.queue.size()==2 && controlled.queue.get(1).startMs==60000);
+    expect(control.up());await(()->!control.browser().items.isEmpty() && control.browser().items.get(0).name.equals("album.cue"));
+    expect(control.up());await(()->control.browser().items.size()==128);
+    // An in-flight local metadata read cannot start local playback after switching to Client.
+    NativeDecoder.entered=new java.util.concurrent.CountDownLatch(1);NativeDecoder.release=new java.util.concurrent.CountDownLatch(1);
+    control.open(control.browser(),1);expect(NativeDecoder.entered.await(2,java.util.concurrent.TimeUnit.SECONDS));
+    control.startBluetooth(BluetoothLink.CLIENT,"fiio");NativeDecoder.release.countDown();
+    await(()->control.browser().paged && control.browser().ready && control.browser().items.size()==50);
+    await(()->NativeDecoder.openCount==0);NativeDecoder.entered=null;NativeDecoder.release=null;
+    expect(controlled.calls.stream().filter("play"::equals).count()==1);
+    int localCalls=controlled.calls.size();serverPlayer.calls.clear();
+    for(PlayerController.Action action:PlayerController.Action.values())
+     if(action!=PlayerController.Action.SEEK && action!=PlayerController.Action.MARKERS)control.perform(action);
+    control.seek(987);control.markers(200,900);
+    await(()->serverPlayer.calls.contains("markers:200:900"));
+    expect(serverPlayer.calls.containsAll(List.of("toggle","resume","pause","stop","next","previous","a","b","loop","clear","seek:987")));
+    expect(controlled.calls.size()==localCalls); // No remote action leaks into the local playback engine.
+    await(()->control.snapshot().title.equals("日本語🎵"));
+    control.page(1);await(()->control.browser().previous);expect(control.browser().items.get(0).name.contains("049"));
+    control.filter("126");await(()->control.browser().items.size()==1);
+    control.chooseFolder(()->pickerCalls[0]++);await(()->control.browser().items.size()==50);expect(pickerCalls[0]==1);
+    control.open(control.browser(),0);await(()->control.browser().items.size()==2);
+    expect(control.up());await(()->control.browser().items.size()==50);
+    control.refresh();await(()->control.browser().items.size()==50);
+    control.stopBluetooth();await(()->!control.browser().paged && control.browser().items.size()==128);
+    control.perform(PlayerController.Action.TOGGLE);expect(controlled.calls.get(controlled.calls.size()-1).equals("toggle"));
+   } finally {control.close();}
+
   }finally{client.close();server.close();}
   expect(client.mode==BluetoothLink.LOCAL && server.mode==BluetoothLink.LOCAL);
-  System.out.println("Bluetooth: framing bounds/UTF-8, handshake, folder paging/filter, full-folder queue, CUE tracks, stale selection rejection, all commands, invalid times, disconnect/reconnect and malformed peer recovery passed");
+  System.out.println("Bluetooth: framing bounds/UTF-8, handshake, folder paging/filter, full-folder queue, CUE tracks, stale selection rejection, all commands, invalid times, disconnect/reconnect, malformed peer recovery, controller routing/local+remote navigation and cancellation on mode switch passed");
  }
 }''')
  app=repo/'app/src/main/java/net/astropenguin/loopdeck'
- sources=list(root.rglob('*.java'))+[app/(name+'.java') for name in ['BluetoothLink','RemoteWire','MusicLibrary','Track','CueSheet']]
+ sources=list(root.rglob('*.java'))+[app/(name+'.java') for name in ['BluetoothLink','RemoteWire','MusicLibrary','Track','CueSheet','PlayerController']]
  subprocess.run(['java','-m','jdk.compiler/com.sun.tools.javac.Main','--release','17','-cp',str(json),'-d',str(root/'classes'),*map(str,sources)],check=True)
  subprocess.run(['java','-cp',str(root/'classes')+':'+str(json),'net.astropenguin.loopdeck.BluetoothTest'],check=True,timeout=40)

@@ -6,3 +6,4 @@ local.properties
 third_party/ffmpeg/
 *.iml
 *.swp
+.DS_Store
