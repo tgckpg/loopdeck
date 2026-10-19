@@ -17,6 +17,7 @@ import net.astropenguin.loopdeck.MusicLibrary.Entry;
 final class BluetoothLink implements AutoCloseable {
     private static final UUID UUID_SERVICE=UUID.fromString("aca23821-cd14-47c2-9d9f-c821ef5c3aa0");
     static final int LOCAL=0, SERVER=1, CLIENT=2, PAGE_SIZE=50;
+    private static final long POSITION_UPDATE_MS=2000;
     private final PlaybackService player;
     private final Handler main=new Handler(Looper.getMainLooper());
     private final BluetoothAdapter adapter;
@@ -28,6 +29,7 @@ final class BluetoothLink implements AutoCloseable {
     volatile boolean connected;
     volatile String status="Bluetooth off", error="";
     volatile PlaybackService.Snapshot remote=emptySnapshot();
+    private long remoteUpdatedAt;
     volatile Listing listing=new Listing(0,"Connect to a player",false,0,0,Collections.emptyList());
 
     static final class Item {
@@ -127,6 +129,16 @@ final class BluetoothLink implements AutoCloseable {
         if (!peer.out.offer(message.toString())) { error="Bluetooth is busy; reconnect"; peer.close(); return false; }
         return true;
     }
+    synchronized PlaybackService.Snapshot remoteSnapshot() {
+        PlaybackService.Snapshot s=remote;
+        if (!connected || !s.playing) return s;
+        // Smooth the remote UI locally; stop estimating if fresh state stops arriving.
+        long elapsed=Math.min(POSITION_UPDATE_MS+500,Math.max(0,android.os.SystemClock.elapsedRealtime()-remoteUpdatedAt));
+        long position=s.position+elapsed;
+        if (s.loop && s.a>=0 && s.b>s.a && position>=s.b) position=s.a+(position-s.a)%(s.b-s.a);
+        if (s.duration>0) position=Math.min(position,s.duration);
+        return new PlaybackService.Snapshot(s.title,s.format,s.status,position,s.duration,s.a,s.b,s.playing,s.loop,s.loaded);
+    }
     void command(String name,Object... args) {
         error="";
         JSONObject json=message(name,args);
@@ -188,17 +200,22 @@ final class BluetoothLink implements AutoCloseable {
             } finally { main.removeCallbacks(timeout); }
         }
         void write() {
-            String previous=""; long last=0;
+            String previous="",previousDetails=""; long last=0;
             try {
                 DataOutputStream output=new DataOutputStream(socket.getOutputStream());
                 while (alive && current(run)) {
-                    String value=out.poll(250,TimeUnit.MILLISECONDS);
+                    String value=role==SERVER ? out.poll(500,TimeUnit.MILLISECONDS) : out.take();
                     if (value!=null) RemoteWire.write(output,value);
                     long now=android.os.SystemClock.elapsedRealtime();
-                    if (role==SERVER && ready && now-last>=500) {
-                        String state=state(player.snapshot).toString();
-                        if (!state.equals(previous)) { RemoteWire.write(output,state); previous=state; }
-                        last=now;
+                    if (role==SERVER && ready) {
+                        JSONObject update=state(player.snapshot);
+                        String state=update.toString();
+                        update.remove("position");
+                        String details=update.toString();
+                        // Track/transport/marker changes bypass the position-only throttle.
+                        if (!state.equals(previous) && (!details.equals(previousDetails) || now-last>=POSITION_UPDATE_MS)) {
+                            RemoteWire.write(output,state); previous=state; previousDetails=details; last=now;
+                        }
                     }
                 }
             } catch (Exception e) { if (alive && current(run)) error=detail(e); }
@@ -212,6 +229,7 @@ final class BluetoothLink implements AutoCloseable {
                     remote=new PlaybackService.Snapshot(value.getString("title"),value.getString("format"),value.getString("status"),
                         value.getLong("position"),value.getLong("duration"),value.getLong("a"),value.getLong("b"),
                         value.getBoolean("playing"),value.getBoolean("loop"),value.getBoolean("loaded"));
+                    remoteUpdatedAt=android.os.SystemClock.elapsedRealtime();
                     if (!remote.title.equals(previous.title) || remote.playing!=previous.playing || remote.loaded!=previous.loaded || remote.duration!=previous.duration)
                         player.bluetoothChanged();
                     break;

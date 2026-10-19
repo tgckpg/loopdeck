@@ -16,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 public final class PlaybackService extends Service {
     private static final String CHANNEL = "playback";
     private static final int NOTIFICATION = 1;
+    private static final int PLAYBACK_BUFFER_SECONDS = 1;
     private static final int NEXT_TRACK_BUFFER_SECONDS = 1;
     private static final int OUTPUT_WARMUP_SECONDS = 1;
     public final class LocalBinder extends Binder { PlaybackService service() { return PlaybackService.this; } }
@@ -59,6 +60,7 @@ public final class PlaybackService extends Service {
     private float[] cache;
     private int cacheFilled, cacheRead;
     private long lastPublish, lastSession;
+    private int lastUnderruns;
 
     static final class Snapshot {
         final String title, format, status;
@@ -285,8 +287,9 @@ public final class PlaybackService extends Service {
             .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             .setAudioFormat(new AudioFormat.Builder().setSampleRate(hz).setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                 .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
-            .setBufferSizeInBytes(Math.max(minimum,hz / 10 * 8)).setTransferMode(AudioTrack.MODE_STREAM).build();
+            .setBufferSizeInBytes(Math.max(minimum,hz * PLAYBACK_BUFFER_SECONDS * 8)).setTransferMode(AudioTrack.MODE_STREAM).build();
         if (result.getState()!=AudioTrack.STATE_INITIALIZED) { result.release(); throw new IllegalArgumentException("Audio output initialization failed"); }
+        lastUnderruns=0;
         return result;
     }
     private void setPlaying(boolean value) throws IOException {
@@ -394,7 +397,10 @@ public final class PlaybackService extends Service {
             count=Math.min(requested,(cache.length-cacheRead)/2);
             System.arraycopy(cache,cacheRead,block,0,count*2); cacheRead+=count*2;
         } else {
+            long started=SystemClock.elapsedRealtime();
             count=activePrefix!=null ? activePrefix.read(block,requested) : NativeDecoder.read(decoder,block,requested);
+            long elapsed=SystemClock.elapsedRealtime()-started;
+            if (elapsed>=100) android.util.Log.w("LoopDeck", "Slow PCM read: "+elapsed+" ms, rate="+rate);
             if (cache!=null && count>0) { System.arraycopy(block,0,cache,cacheFilled,count*2); cacheFilled+=count*2; }
         }
         if (count==0) {
@@ -412,9 +418,21 @@ public final class PlaybackService extends Service {
                     adoptTransition();
                     Command command=commands.poll(playing ? 0 : 100,TimeUnit.MILLISECONDS);
                     if (command!=null) { command.run(); publish(); updateSession(); }
-                    if (playing && output!=null && !pump()) Thread.sleep(5);
+                    if (playing && output!=null && !pump()) {
+                        // A full one-second output queue needs no 5 ms busy retry.
+                        // Keep commands responsive and wake well before queued audio drains.
+                        long queued=Math.max(0,written-playedFrames());
+                        Thread.sleep(Math.max(1,Math.min(20,queued*500/Math.max(1,rate))));
+                    }
                     long now=SystemClock.elapsedRealtime();
-                    if (now-lastPublish>=200) { publish(); lastPublish=now; }
+                    if (now-lastPublish>=200) {
+                        if (output!=null) {
+                            int underruns=output.getUnderrunCount();
+                            if (underruns>lastUnderruns) android.util.Log.w("LoopDeck", "AudioTrack underrun: +"+(underruns-lastUnderruns)+", rate="+rate);
+                            lastUnderruns=underruns;
+                        }
+                        publish(); lastPublish=now;
+                    }
                     if (now-lastSession>=1000) { updateSession(false); lastSession=now; }
                 } catch (InterruptedException e) { if (!running) break; }
                 catch (Exception | LinkageError e) {

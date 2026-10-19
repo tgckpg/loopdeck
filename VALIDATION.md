@@ -196,3 +196,26 @@ Bluetooth throughput, permissions and vendor background behavior remain unverifi
 
 No APK was built. Device UI, permission dialogs and real Bluetooth remain checks
 for the owner after applying the patch.
+
+## Bluetooth cadence and playback starvation mitigation (base 65a388d)
+
+- Server position corrections now arrive at most once per two seconds; changes
+  to transport, metadata and loop markers bypass that throttle. The client
+  estimates position locally, clamps at track duration and wraps A–B loops.
+  Unchanged states are not resent; the client writer blocks until a command.
+- Requested AudioTrack buffering increased from 100 ms to one second at the
+  selected output rate. Full-queue retries now wait up to 20 ms rather than 5 ms.
+  `LoopDeck` warnings report AudioTrack underrun counter increases and PCM reads
+  taking at least 100 ms. These are diagnostics, not proof of a particular cause.
+- The Bluetooth host integration test passed, including bounded correction
+  frequency during advancing playback, pause delivery bypassing the throttle,
+  stopped extrapolation on pause and loop position wrapping.
+- The playback host test passed using the requested buffer capacity, including
+  native 96 kHz/fallback 48 kHz buffer sizes, silent startup, EOF replay, exact
+  gapless samples, audible track metadata, seek cancellation and resource cleanup.
+
+No APK was built. Device temperature, CPU load, actual AudioTrack capacity and
+real underrun recovery require hardware measurements. Compare the same files
+with Server enabled/disabled and collect `adb logcat -s LoopDeck:W` if a gap recurs.
+A one-second output queue cannot hide stalls longer than the audio queued at the
+moment they occur.

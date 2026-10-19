@@ -70,7 +70,7 @@ final class PlayerController implements AutoCloseable {
     boolean bluetoothEnabled() { return bluetooth.mode!=BluetoothLink.LOCAL; }
     boolean available() { return !remote() || bluetooth.connected; }
     boolean hasMusicFolder() { return tree!=null; }
-    PlaybackService.Snapshot snapshot() { return remote() ? bluetooth.remote : player.snapshot; }
+    PlaybackService.Snapshot snapshot() { return remote() ? bluetooth.remoteSnapshot() : player.snapshot; }
     String bluetoothStatus() { return bluetooth.status; }
     String status() {
         String error=!bluetooth.error.isEmpty() ? "Bluetooth: "+bluetooth.error : remote() ? "" : browserError;

@@ -123,6 +123,29 @@ public final class BluetoothTest {
    client.start(BluetoothLink.CLIENT,"fiio");await(()->client.connected && server.connected && client.listing.total==128);
    expect(client.listing.items.size()==BluetoothLink.PAGE_SIZE);
    await(()->client.remote.title.equals("日本語🎵"));expect(client.remote.position==1234 && client.remote.playing);
+   // A steadily advancing position produces at most one correction per two seconds.
+   PlaybackService.Snapshot seen=client.remote;int corrections=0;
+   long started=android.os.SystemClock.elapsedRealtime();
+   while(android.os.SystemClock.elapsedRealtime()-started<2600){
+    long elapsed=android.os.SystemClock.elapsedRealtime()-started;
+    serverPlayer.snapshot=new PlaybackService.Snapshot("日本語🎵","FLAC 96k","Ready",1234+elapsed,120000,-1,-1,true,false,true);
+    Thread.sleep(10);
+    PlaybackService.Snapshot latest=client.remote;
+    if(latest!=seen){corrections++;seen=latest;}
+   }
+   expect(corrections>=1 && corrections<=2);
+   PlaybackService.Snapshot estimated=client.remoteSnapshot();
+   expect(estimated.position>=seen.position && estimated.position<=seen.position+2500);
+   // Pause bypasses the position throttle and stops local extrapolation.
+   long pausedAt=android.os.SystemClock.elapsedRealtime();
+   serverPlayer.snapshot=new PlaybackService.Snapshot("日本語🎵","FLAC 96k","Ready",5000,120000,-1,-1,false,false,true);
+   await(()->!client.remote.playing);
+   expect(android.os.SystemClock.elapsedRealtime()-pausedAt<1200 && client.remoteSnapshot().position==5000);
+   // Interpolation wraps at B rather than moving beyond the loop.
+   serverPlayer.snapshot=new PlaybackService.Snapshot("日本語🎵","FLAC 96k","Ready",1010,120000,1000,1020,true,true,true);
+   await(()->client.remote.loop);Thread.sleep(60);
+   expect(client.remoteSnapshot().position>=1000 && client.remoteSnapshot().position<1020);
+   serverPlayer.snapshot=new PlaybackService.Snapshot("日本語🎵","FLAC 96k","Ready",1234,120000,-1,-1,true,false,true);
    BluetoothLink.Listing root=client.listing;
    client.page(50);await(()->client.listing.offset==50);expect(client.listing.items.get(0).id==50);
    client.open(client.listing.items.get(0),client.listing);await(()->serverPlayer.calls.contains("play"));
